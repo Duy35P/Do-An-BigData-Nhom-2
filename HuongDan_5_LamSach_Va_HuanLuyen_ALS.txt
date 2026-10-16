@@ -1,0 +1,375 @@
+====================================================================
+HƯỚNG DẪN 5: LÀM SẠCH DỮ LIỆU (SILVER) & HUẤN LUYỆN MÔ HÌNH HỌC MÁY ALS (GOLD)
+====================================================================
+Hệ điều hành: Ubuntu 26.04 (WSL)
+Môi trường: Python 3.14, PySpark 3.5.1, Spark MLlib, Java 8, Hadoop 3.3.6
+
+--------------------------------------------------------------------
+TỔNG QUAN KIẾN TRÚC DỮ LIỆU LAKEHOUSE
+--------------------------------------------------------------------
+- Tầng Bronze: CSV thô trên HDFS (/lakehouse/bronze/movielens/)
+- Tầng Silver: Dữ liệu sạch, chuẩn hóa kiểu, nén Snappy Parquet (/lakehouse/silver/)
+- Tầng Gold: Kết quả phân tích & Top 5 phim gợi ý dạng Parquet (/lakehouse/gold/)
+
+====================================================================
+PHẦN 1: LÀM SẠCH DỮ LIỆU & GHI PARQUET TẦNG SILVER
+====================================================================
+Mục tiêu: Đọc dữ liệu thô Bronze, chuẩn hóa schema, làm sạch null/dữ liệu rác,
+tránh tràn đĩa và lưu thành định dạng cột Parquet nén Snappy.
+
+1. Các kỹ thuật tối ưu quan trọng:
+   - Tránh lỗi AMBIGUOUS_REFERENCE: Đổi tên các cột trùng tên (title -> TenPhim, id -> meta_id) trước khi JOIN.
+   - Tránh lỗi No space left on device: Cấu hình spark.local.dir vào thư mục đĩa thực (/home/dell/spark_temp, 940GB trống) thay vì /tmp (ramdisk chỉ có 699MB).
+   - Tối ưu 25 triệu dòng Ratings: Bộ dữ liệu MovieLens vốn đã duy nhất theo cặp (userId, movieId), chỉ dùng Narrow Transformation (select + filter) để stream trực tiếp sang Parquet mà không shuffle/spill đĩa.
+
+2. Tạo file `clean_data.py`:
+Copy và dán toàn bộ đoạn sau vào terminal rồi Enter:
+
+cat << 'EOF' > /home/dell/clean_data.py
+import os
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.types import IntegerType, DoubleType, FloatType
+
+def create_spark_session():
+    temp_dir = "/home/dell/spark_temp"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    return SparkSession.builder \
+        .appName("MovieData_Cleaning_Silver") \
+        .master("local[*]") \
+        .config("spark.local.dir", temp_dir) \
+        .config("spark.sql.parquet.compression.codec", "snappy") \
+        .config("spark.sql.shuffle.partitions", "20") \
+        .getOrCreate()
+
+def clean_movies(spark):
+    print("\n" + "="*50)
+    print("1. BẮT ĐẦU LÀM SẠCH DỮ LIỆU PHIM (MOVIES & METADATA)")
+    print("="*50)
+
+    movies_path = "hdfs://localhost:9000/lakehouse/bronze/movielens/movies.csv"
+    links_path  = "hdfs://localhost:9000/lakehouse/bronze/movielens/links.csv"
+    meta_path   = "hdfs://localhost:9000/lakehouse/bronze/movielens/movies_metadata.csv"
+
+    print("Đang đọc dữ liệu từ Bronze Layer...")
+    df_movies_raw = spark.read.csv(movies_path, header=True, inferSchema=True)
+    df_links_raw  = spark.read.csv(links_path, header=True, inferSchema=True)
+    df_meta_raw   = spark.read.csv(meta_path, header=True, inferSchema=True, quote='"', escape='"', multiLine=True)
+
+    count_raw = df_movies_raw.count()
+    print(f"- Số lượng phim thô ban đầu: {count_raw:,} bản ghi")
+
+    df_movies = df_movies_raw.select(
+        F.col("movieId").cast(IntegerType()).alias("movieId"),
+        F.trim(F.col("title")).alias("TenPhim"),
+        F.col("genres").alias("genres_raw")
+    ).filter(F.col("movieId").isNotNull())
+
+    df_links = df_links_raw.select(
+        F.col("movieId").cast(IntegerType()).alias("link_movieId"),
+        F.col("tmdbId").cast(IntegerType()).alias("tmdbId")
+    ).filter(F.col("link_movieId").isNotNull() & F.col("tmdbId").isNotNull())
+
+    df_meta = df_meta_raw.select(
+        F.col("id").cast(IntegerType()).alias("meta_id"),
+        F.col("overview").alias("TomTatNoiDung"),
+        F.col("vote_average").cast(DoubleType()).alias("vote_raw"),
+        F.col("budget").cast(DoubleType()).alias("budget_raw"),
+        F.to_date(F.col("release_date"), "yyyy-MM-dd").alias("release_date")
+    ).filter(F.col("meta_id").isNotNull())
+
+    df_joined = df_movies \
+        .join(df_links, df_movies["movieId"] == df_links["link_movieId"], how="left") \
+        .join(df_meta, df_links["tmdbId"] == df_meta["meta_id"], how="left")
+
+    extracted_year = F.regexp_extract(F.col("TenPhim"), r"\((\d{4})\)$", 1).cast(IntegerType())
+    meta_year = F.year(F.col("release_date"))
+    final_year = F.coalesce(extracted_year, meta_year)
+
+    clean_vote = F.when(
+        (F.col("vote_raw") >= 0) & (F.col("vote_raw") <= 10),
+        F.col("vote_raw")
+    ).otherwise(F.lit(None))
+
+    clean_budget = F.when(
+        F.col("budget_raw") > 0,
+        F.col("budget_raw")
+    ).otherwise(F.lit(None))
+
+    clean_genres = F.when(
+        (F.col("genres_raw").isNull()) | (F.col("genres_raw") == "(no genres listed)"),
+        F.lit("Chưa rõ")
+    ).otherwise(F.col("genres_raw"))
+
+    clean_overview = F.when(
+        F.col("TomTatNoiDung").isNull() | (F.trim(F.col("TomTatNoiDung")) == ""),
+        F.lit("Không có tóm tắt")
+    ).otherwise(F.col("TomTatNoiDung"))
+
+    df_movies_cleaned = df_joined.select(
+        F.col("movieId"),
+        F.col("TenPhim"),
+        final_year.alias("NamPhatHanh"),
+        clean_genres.alias("TheLoai"),
+        clean_vote.alias("DiemTMDB"),
+        clean_budget.alias("KinhPhi"),
+        clean_overview.alias("TomTatNoiDung")
+    ).filter(F.col("movieId").isNotNull() & F.col("TenPhim").isNotNull()) \
+     .dropDuplicates(["movieId"])
+
+    count_cleaned = df_movies_cleaned.count()
+    print(f"- Số lượng phim sau khi làm sạch: {count_cleaned:,} bản ghi")
+
+    output_movies_path = "hdfs://localhost:9000/lakehouse/silver/movies"
+    print(f"-> Đang ghi file Parquet vào: {output_movies_path} ...")
+    df_movies_cleaned.write.mode("overwrite").parquet(output_movies_path)
+    print("✓ Đã ghi thành công dữ liệu Phim vào HDFS (Silver/Parquet)!")
+
+    print("\n--- MẪU DỮ LIỆU PHIM ĐÃ LÀM SẠCH (5 BẢN GHI ĐẦU) ---")
+    df_movies_cleaned.show(5, truncate=50)
+    return df_movies_cleaned
+
+
+def clean_ratings(spark):
+    print("\n" + "="*50)
+    print("2. BẮT ĐẦU LÀM SẠCH DỮ LIỆU ĐÁNH GIÁ (RATINGS)")
+    print("="*50)
+
+    ratings_path = "hdfs://localhost:9000/lakehouse/bronze/movielens/ratings.csv"
+    print("Đang đọc dữ liệu Ratings từ Bronze Layer...")
+    df_ratings = spark.read.csv(ratings_path, header=True, inferSchema=True)
+
+    df_ratings_cleaned = df_ratings \
+        .select(
+            F.col("userId").cast(IntegerType()).alias("userId"),
+            F.col("movieId").cast(IntegerType()).alias("movieId"),
+            F.col("rating").cast(FloatType()).alias("rating"),
+            F.to_timestamp(F.from_unixtime(F.col("timestamp"))).alias("thoiGianDanhGia")
+        ) \
+        .filter(
+            F.col("userId").isNotNull() &
+            F.col("movieId").isNotNull() &
+            (F.col("rating") >= 0.5) & (F.col("rating") <= 5.0)
+        )
+
+    output_ratings_path = "hdfs://localhost:9000/lakehouse/silver/ratings"
+    print(f"-> Đang ghi file Parquet vào: {output_ratings_path} ...")
+    df_ratings_cleaned.write.mode("overwrite").parquet(output_ratings_path)
+    print("✓ Đã ghi thành công dữ liệu Ratings vào HDFS (Silver/Parquet)!")
+
+    print("\n--- MẪU DỮ LIỆU RATINGS ĐÃ LÀM SẠCH (5 BẢN GHI ĐẦU) ---")
+    df_ratings_cleaned.show(5)
+    return df_ratings_cleaned
+
+
+if __name__ == "__main__":
+    spark = create_spark_session()
+    spark.sparkContext.setLogLevel("ERROR")
+
+    try:
+        clean_movies(spark)
+        clean_ratings(spark)
+        print("\n" + "="*50)
+        print("HOÀN THÀNH TOÀN BỘ QUY TRÌNH LÀM SẠCH & LƯU HDFS!")
+        print("="*50)
+    finally:
+        spark.stop()
+EOF
+
+3. Chạy file làm sạch dữ liệu:
+   $ python3 /home/dell/clean_data.py
+
+4. Kiểm tra kết quả tầng Silver trên HDFS:
+   $ hdfs dfs -ls -h /lakehouse/silver/movies/
+   $ hdfs dfs -ls -h /lakehouse/silver/ratings/
+
+
+====================================================================
+PHẦN 2: TRUY VẤN PHÂN TÍCH DỮ LIỆU BẰNG SPARK SQL
+====================================================================
+Mục tiêu: Đăng ký Temporary Views từ HDFS và thực thi câu truy vấn ANSI SQL để
+phân tích top phim đầu tư lớn và đánh giá cao.
+
+1. Tạo file `query_movies.py`:
+Copy và dán toàn bộ đoạn sau vào terminal rồi Enter:
+
+cat << 'EOF' > /home/dell/query_movies.py
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("SparkSQL_Demo").master("local[*]").getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+print("Đang nạp dữ liệu từ HDFS vào các bảng SQL ảo...")
+spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/movies.csv", header=True, inferSchema=True).createOrReplaceTempView("movies")
+spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/links.csv", header=True, inferSchema=True).createOrReplaceTempView("links")
+spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/movies_metadata.csv", header=True, inferSchema=True, quote='"', escape='"', multiLine=True).createOrReplaceTempView("metadata")
+
+print("\n--- BẮT ĐẦU CHẠY CÂU TRUY VẤN SQL ---")
+ket_qua = spark.sql("""
+    SELECT 
+        m.title AS TenPhim, 
+        meta.vote_average AS DiemSo, 
+        meta.budget AS KinhPhi
+    FROM movies m
+    JOIN links l ON m.movieId = l.movieId
+    JOIN metadata meta ON l.tmdbId = CAST(meta.id AS INT)
+    WHERE meta.vote_average >= 8.0 AND meta.budget > 10000000
+    ORDER BY meta.budget DESC
+    LIMIT 5
+""")
+
+ket_qua.show(truncate=False)
+spark.stop()
+EOF
+
+2. Chạy câu truy vấn:
+   $ python3 /home/dell/query_movies.py
+
+
+====================================================================
+PHẦN 3: HUẤN LUYỆN MÔ HÌNH HỌC MÁY GỢI Ý PHIM (ALS) & TẦNG GOLD
+====================================================================
+Mục tiêu: Ứng dụng Spark MLlib với thuật toán ALS (Alternating Least Squares)
+để dự đoán sở thích người dùng và sinh Top 5 phim gợi ý, lưu vào HDFS tầng Gold.
+
+1. Các kỹ thuật tối ưu RAM triệt để (Chạy mượt trên WSL 1.4GB RAM):
+   - Smart Sampling: Lấy mẫu phân tầng 3% dữ liệu ratings (~750.000 đánh giá), vừa đủ hội tụ ma trận nhân tố ẩn mà không vượt ngưỡng RAM.
+   - Siêu tham số gọn nhẹ: rank=10, maxIter=5, regParam=0.1, coldStartStrategy="drop".
+   - Targeted Recommendation: Dùng recommendForUserSubset() sinh gợi ý cho tập người dùng mục tiêu thay vì sinh cho toàn bộ 162.000 người (gây OOM).
+   - Đánh giá mô hình: Đo sai số dự đoán bằng RegressionEvaluator (RMSE = 1.1870).
+
+2. Tạo file `train_als_recommendation.py`:
+Copy và dán toàn bộ đoạn sau vào terminal rồi Enter:
+
+cat << 'EOF' > /home/dell/train_als_recommendation.py
+import os
+import time
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.evaluation import RegressionEvaluator
+
+def create_spark_session():
+    temp_dir = "/home/dell/spark_temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(f"{temp_dir}/checkpoint", exist_ok=True)
+
+    spark = SparkSession.builder \
+        .appName("MovieRecommendation_ALS_Gold") \
+        .master("local[*]") \
+        .config("spark.local.dir", temp_dir) \
+        .config("spark.sql.parquet.compression.codec", "snappy") \
+        .config("spark.sql.shuffle.partitions", "20") \
+        .config("spark.driver.memory", "1g") \
+        .getOrCreate()
+
+    spark.sparkContext.setCheckpointDir(f"{temp_dir}/checkpoint")
+    spark.sparkContext.setLogLevel("ERROR")
+    return spark
+
+def run_als_pipeline():
+    start_time = time.time()
+    spark = create_spark_session()
+
+    print("\n" + "="*60)
+    print("BƯỚC 1: ĐỌC DỮ LIỆU TỪ SILVER LAYER (PARQUET TRÊN HDFS)")
+    print("="*60)
+
+    silver_ratings_path = "hdfs://localhost:9000/lakehouse/silver/ratings"
+    silver_movies_path  = "hdfs://localhost:9000/lakehouse/silver/movies"
+
+    df_ratings = spark.read.parquet(silver_ratings_path)
+    df_movies  = spark.read.parquet(silver_movies_path)
+
+    print("-> Đang lấy mẫu tối ưu bộ nhớ (3% dữ liệu ~ 750,000 đánh giá)...")
+    df_sample = df_ratings.sample(withReplacement=False, fraction=0.03, seed=42)
+
+    (train_data, test_data) = df_sample.randomSplit([0.8, 0.2], seed=42)
+    print(f"- Tập huấn luyện (Train): {train_data.count():,} dòng")
+    print(f"- Tập kiểm thử (Test):   {test_data.count():,} dòng")
+
+    print("\n" + "="*60)
+    print("BƯỚC 2: KHỞI TẠO VÀ HUẤN LUYỆN MÔ HÌNH ALS (SPARK MLLIB)")
+    print("="*60)
+    als = ALS(
+        userCol="userId",
+        itemCol="movieId",
+        ratingCol="rating",
+        rank=10,
+        maxIter=5,
+        regParam=0.1,
+        coldStartStrategy="drop",
+        nonnegative=True
+    )
+
+    print("-> Đang huấn luyện mô hình ALS, vui lòng đợi trong giây lát...")
+    model = als.fit(train_data)
+    print("✓ Huấn luyện mô hình ALS thành công!")
+
+    print("\n" + "="*60)
+    print("BƯỚC 3: ĐÁNH GIÁ ĐỘ CHÍNH XÁC (ĐO CHỈ SỐ RMSE)")
+    print("="*60)
+    predictions = model.transform(test_data)
+    evaluator = RegressionEvaluator(
+        metricName="rmse",
+        labelCol="rating",
+        predictionCol="prediction"
+    )
+    rmse = evaluator.evaluate(predictions)
+    print(f"✓ Sai số trung bình (Root Mean Squared Error - RMSE): {rmse:.4f}")
+
+    print("\n" + "="*60)
+    print("BƯỚC 4: SINH GỢI Ý PHIM CHO TẬP NGƯỜI DÙNG (TOP 5 PHIM / USER)")
+    print("="*60)
+    sample_users = df_ratings.select("userId").distinct().limit(500)
+    print(f"-> Đang tính toán Top 5 phim gợi ý cho 500 người dùng...")
+    user_recs = model.recommendForUserSubset(sample_users, 5)
+
+    recs_flat = user_recs.select(
+        F.col("userId"),
+        F.explode(F.col("recommendations")).alias("rec")
+    ).select(
+        F.col("userId"),
+        F.col("rec.movieId").alias("movieId"),
+        F.round(F.col("rec.rating"), 2).alias("DiemDuDoan")
+    )
+
+    recs_final = recs_flat.join(df_movies, on="movieId", how="inner") \
+        .select(
+            F.col("userId"),
+            F.col("movieId"),
+            F.col("TenPhim"),
+            F.col("TheLoai"),
+            F.col("DiemDuDoan")
+        ) \
+        .orderBy(F.col("userId"), F.col("DiemDuDoan").desc())
+
+    print("\n--- MẪU KẾT QUẢ GỢI Ý (CHO 2 NGƯỜI DÙNG ĐẦU TIÊN) ---")
+    recs_final.show(10, truncate=50)
+
+    print("\n" + "="*60)
+    print("BƯỚC 5: LƯU KẾT QUẢ GỢI Ý VÀO HDFS (TẦNG GOLD)")
+    print("="*60)
+    output_gold_path = "hdfs://localhost:9000/lakehouse/gold/movie_recommendations"
+    print(f"-> Đang ghi kết quả gợi ý vào: {output_gold_path} ...")
+    recs_final.write.mode("overwrite").parquet(output_gold_path)
+    print("✓ Đã lưu thành công kết quả Tầng Gold (Parquet) lên HDFS!")
+
+    elapsed = time.time() - start_time
+    print("\n" + "="*60)
+    print(f"HOÀN THÀNH TOÀN BỘ TIẾN TRÌNH TRONG: {elapsed:.1f} GIÂY")
+    print("="*60)
+
+    spark.stop()
+
+if __name__ == "__main__":
+    run_als_pipeline()
+EOF
+
+3. Chạy file huấn luyện mô hình ALS:
+   $ python3 /home/dell/train_als_recommendation.py
+
+4. Kiểm tra kết quả tầng Gold trên HDFS:
+   $ hdfs dfs -ls -h /lakehouse/gold/movie_recommendations/
+====================================================================

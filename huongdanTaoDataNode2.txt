@@ -1,0 +1,87 @@
+====================================================================
+HƯỚNG DẪN CẤU HÌNH 2 DATANODES TRÊN CÙNG 1 MÁY ẢO (PSEUDO-DISTRIBUTED)
+====================================================================
+
+LƯU Ý: Mặc định Hadoop chỉ cho phép chạy 1 DataNode trên 1 máy ảo (1 địa chỉ IP). 
+Để khởi chạy DataNode thứ 2 trên cùng 1 máy nhằm mô phỏng kiến trúc phân tán thực thụ, 
+chúng ta phải nhân bản cấu hình và giải quyết 3 điểm xung đột:
+1. Xung đột Port (Cổng mạng)
+2. Xung đột PID (File định danh tiến trình)
+3. Xung đột Thư mục Log
+
+(Giả định Hadoop đang được cài đặt tại: /usr/local/hadoop)
+
+---------------------------------------------------------
+BƯỚC 1: TẮT HỆ THỐNG VÀ TẠO KHÔNG GIAN CHO NODE 2
+---------------------------------------------------------
+Tắt cụm HDFS hiện tại để đảm bảo an toàn:
+    stop-dfs.sh
+
+Tạo các thư mục riêng biệt để DataNode 2 lưu Dữ liệu, Log và PID:
+    mkdir -p /usr/local/hadoop/data/datanode2
+    mkdir -p /tmp/hadoop2-pids
+    mkdir -p /usr/local/hadoop/logs2
+
+---------------------------------------------------------
+BƯỚC 2: NHÂN BẢN CẤU HÌNH HADOOP
+---------------------------------------------------------
+Copy toàn bộ thư mục cấu hình gốc sang một bản sao dành riêng cho Node 2:
+    cp -r /usr/local/hadoop/etc/hadoop /usr/local/hadoop/etc/hadoop2
+
+Trỏ đường dẫn PID và Log của Node 2 vào thư mục mới tạo (tránh xung đột với Node 1):
+    echo "export HADOOP_PID_DIR=/tmp/hadoop2-pids" >> /usr/local/hadoop/etc/hadoop2/hadoop-env.sh
+    echo "export HADOOP_LOG_DIR=/usr/local/hadoop/logs2" >> /usr/local/hadoop/etc/hadoop2/hadoop-env.sh
+
+---------------------------------------------------------
+BƯỚC 3: ĐỔI CỔNG (PORT) CHO DATANODE 2
+---------------------------------------------------------
+Copy toàn bộ khối lệnh dưới đây dán vào Terminal và ấn Enter. 
+Lệnh này sẽ ghi đè file hdfs-site.xml của Node 2, cấu hình các Port mới (9884, 9886, 9887) 
+cách xa cụm Port mặc định của Node 1 (9864, 9866, 9867).
+
+cat <<EOF > /usr/local/hadoop/etc/hadoop2/hdfs-site.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+    <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>file:///usr/local/hadoop/data/datanode2</value>
+    </property>
+    <property>
+        <name>dfs.datanode.address</name>
+        <value>0.0.0.0:9886</value>
+    </property>
+    <property>
+        <name>dfs.datanode.http.address</name>
+        <value>0.0.0.0:9884</value>
+    </property>
+    <property>
+        <name>dfs.datanode.ipc.address</name>
+        <value>0.0.0.0:9887</value>
+    </property>
+</configuration>
+EOF
+
+---------------------------------------------------------
+BƯỚC 4: KHỞI ĐỘNG VÀ KIỂM TRA
+---------------------------------------------------------
+1. Khởi động cụm HDFS gốc (Bao gồm NameNode, SecNameNode và DataNode 1):
+    start-dfs.sh
+
+2. Khởi động thủ công DataNode 2 bằng cấu hình nhánh phụ:
+    hdfs --config /usr/local/hadoop/etc/hadoop2 --daemon start datanode
+
+3. Kiểm tra bằng lệnh:
+    jps
+
+Kết quả mong đợi (Sẽ thấy 2 tiến trình DataNode):
+    xxxx Jps
+    xxxx DataNode
+    xxxx DataNode
+    xxxx SecondaryNameNode
+    xxxx NameNode
+
+4. Kiểm tra trên Web UI:
+Mở trình duyệt truy cập: http://localhost:9870
+Chuyển sang tab "Datanodes" sẽ thấy hệ thống báo "Live Nodes: 2" (Với 2 cổng 9866 và 9886).
+====================================================================

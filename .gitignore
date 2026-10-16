@@ -1,0 +1,26 @@
+# Large Archives (> 100MB exceeds GitHub limit)
+archive.zip
+*.zip
+*.tar.gz
+*.tgz
+
+# Backup and redundant draft files
+*.bak
+*BACKUP*
+*.tmp
+*HoanThien (1)*
+
+# Duplicate directories
+code_project/
+Goi_Nop_DoAn_BigData_Nhom2/
+D??DAIHOC*
+
+# Python & IDE
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+movie_env/
+.idea/
+.vscode/

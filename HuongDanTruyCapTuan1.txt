@@ -1,0 +1,31 @@
+Mỗi lần mở máy tính lên muốn xem lại trang web, bạn chỉ cần mở PowerShell và gõ lần lượt 4 lệnh sau:
+
+powershell
+
+
+wsl -d Ubuntu-26.04
+bash
+
+
+su - dell
+bash
+
+
+start-dfs.sh
+
+2. Khởi động thủ công DataNode 2 bằng cấu hình nhánh phụ:
+    hdfs --config /usr/local/hadoop/etc/hadoop2 --daemon start datanode
+bash
+
+
+source movie_env/bin/activate && uvicorn main:app --reload
+Xong! Mở Chrome vào http://localhost:8000 là thấy trang web hiện lên.
+
+Khi muốn tắt hết để nghỉ ngơi:
+
+Bấm Ctrl + C trên Terminal (tắt Web Server).
+Gõ stop-dfs.sh (tắt Hadoop để trả RAM cho Windows).
+
+Airflow
+admin
+rQkxSVcQXRPZq7sZ

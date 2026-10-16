@@ -1,0 +1,78 @@
+================================================================================
+KỊCH BẢN KHỞI ĐỘNG VÀ VẬN HÀNH HỆ THỐNG KAFKA & AIRFLOW (TỪ ĐẦU)
+================================================================================
+Mỗi khi khởi động lại máy tính hoặc mở lại PowerShell mới, hãy làm theo từng bước sau:
+
+--------------------------------------------------------------------------------
+BƯỚC 0: ĐĂNG NHẬP VÀO WSL VÀ BẬT HADOOP HDFS (NỀN TẢNG KHO CHỨA DỮ LIỆU)
+--------------------------------------------------------------------------------
+Mở PowerShell 1 (Cửa sổ chính) và gõ:
+
+wsl -d Ubuntu-26.04
+su - dell
+start-all.sh
+
+Kiểm tra xem Hadoop đã chạy chưa bằng lệnh:
+jps
+(Nếu thấy NameNode, DataNode, SecondaryNameNode là thành công).
+
+
+--------------------------------------------------------------------------------
+PHẦN 1: KHỞI ĐỘNG VÀ CHẠY LUỒNG KAFKA (STREAMING INGESTION)
+--------------------------------------------------------------------------------
+Do mỗi lần tắt/bật lại WSL, thư mục /tmp sẽ bị xóa sạch, nên bạn hãy chạy lệnh sau 
+để khởi tạo và bật Kafka Server:
+
+[Tại Terminal 1]:
+cd ~/kafka_2.12-3.6.2
+KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
+bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c config/kraft/server.properties
+bin/kafka-server-start.sh -daemon config/kraft/server.properties
+sleep 3
+bin/kafka-topics.sh --create --topic movie_logs --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+cd ~
+
+Kiểm tra: gõ `jps` xem có tiến trình "Kafka" chưa.
+
+Tiếp theo:
+- Cửa sổ này để chạy Spark Streaming hứng dữ liệu từ Kafka đổ vào HDFS:
+  python3 spark_streaming.py
+
+- Mở thêm một tab/cửa sổ PowerShell mới (PowerShell 2):
+  wsl -d Ubuntu-26.04
+  su - dell
+  python3 producer.py
+
+-> Bạn sẽ thấy producer bắn log liên tục. Muốn dừng producer thì bấm Ctrl + C.
+-> Muốn kiểm tra dữ liệu đã vào HDFS hay chưa, gõ lệnh:
+   hdfs dfs -ls /lakehouse/silver/streaming_logs/
+
+
+--------------------------------------------------------------------------------
+PHẦN 2: KHỞI ĐỘNG VÀ VẬN HÀNH APACHE AIRFLOW (ORCHESTRATION)
+--------------------------------------------------------------------------------
+Mở một tab/cửa sổ PowerShell mới (PowerShell 3):
+
+wsl -d Ubuntu-26.04
+su - dell
+export AIRFLOW_HOME=~/airflow
+airflow standalone
+
+Lấy mật khẩu đăng nhập Admin (nếu chưa lưu):
+Mở một cửa sổ terminal khác và gõ:
+cat ~/airflow/simple_auth_manager_passwords.json.generated
+
+Truy cập giao diện Web:
+1. Mở trình duyệt web truy cập: http://localhost:8080
+2. Đăng nhập với username: admin và mật khẩu lấy từ file trên.
+3. Tìm kiếm DAG tên là: `movie_data_pipeline`.
+4. Bật công tắc Unpause (chuyển sang màu xanh dương).
+5. Bấm nút Play (▷) -> chọn "Trigger DAG" để bắt đầu chạy kịch bản tự động gọi Spark.
+6. Bấm vào tên DAG, chọn tab Logs để xem bảng danh sách phim đã xử lý.
+
+--------------------------------------------------------------------------------
+TỔNG KẾT BỐ TRÍ CỬA SỔ LÀM VIỆC LÝ TƯỞNG:
+- PowerShell 1: Chạy Hadoop (start-all.sh) + chạy Kafka server + chạy spark_streaming.py
+- PowerShell 2: Chạy producer.py (để bắn dữ liệu giả lập)
+- PowerShell 3: Chạy airflow standalone (giữ server Web và Scheduler của Airflow hoạt động)
+================================================================================

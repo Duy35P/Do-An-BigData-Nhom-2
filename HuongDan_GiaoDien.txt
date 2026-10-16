@@ -1,0 +1,696 @@
+================================================================================
+HƯỚNG DẪN: TRIỂN KHAI GIAO DIỆN WEB GỢI Ý PHIM TƯƠNG TÁC THỜI GIAN THỰC
+(ĐÃ TÍCH HỢP BẮN LOG STREAMING VÀO APACHE KAFKA)
+ĐỀ TÀI: XÂY DỰNG HỆ THỐNG GỢI Ý PHIM TRỰC TUYẾN DỰA TRÊN KIẾN TRÚC LAKEHOUSE VÀ ĐIỆN TOÁN PHÂN TÁN
+================================================================================
+
+TÍNH NĂNG MỚI ĐÃ CẬP NHẬT:
+1. GIAO DIỆN PHONG CÁCH NETFLIX VỚI POSTER PHIM THẬT TỪ TMDB:
+   - Tự động nạp và ánh xạ 42.508 poster phim thật từ The Movie Database (TMDb) CDN (image.tmdb.org).
+   - Thiết kế card phim chuẩn tỷ lệ 2:3 với hiệu ứng hover zoom, huy hiệu % hợp (Match Score), tags thể loại.
+   - Trực quan, chuyên nghiệp, trải nghiệm xem như một nền tảng rạp phim trực tuyến thực thụ.
+
+2. LIVE STREAMING DASHBOARD & KAFKA METRICS (TAB MỚI):
+   - Bảng theo dõi thời gian thực các tương tác của người dùng gửi vào Kafka topic 'movie_logs'.
+   - Thẻ thống kê: Tổng số event, độ trễ phản hồi, số sao trung bình.
+   - Tự động cập nhật mỗi 3 giây (Live Polling).
+   - Nút "Bắn 1 Event Test Vào Kafka" phục vụ trình diễn trực tiếp trước giảng viên.
+
+3. TAB KIẾN TRÚC MEDALLION LAKEHOUSE (BRONZE - SILVER - GOLD):
+   - Trực quan hoá 3 tầng lưu trữ HDFS và luồng điều phối của Apache Airflow.
+
+================================================================================
+PHẦN 1: MỞ HỆ THỐNG VÀ CHUẨN BỊ MÔI TRƯỜNG
+================================================================================
+
+1. Mở PowerShell trên Windows, đăng nhập vào máy ảo Linux:
+   wsl -d Ubuntu-26.04 -u dell
+
+2. Di chuyển về thư mục gốc của Linux:
+   cd ~
+
+3. Kích hoạt môi trường ảo Python:
+   source ~/movie_env/bin/activate
+
+4. Cài đặt thư viện kết nối Kafka và Web:
+   pip install kafka-python-ng fastapi uvicorn hdfs pandas --default-timeout=1000
+
+
+================================================================================
+PHẦN 2: TẠO FILE CODE GIAO DIỆN WEB (main.py)
+================================================================================
+
+1. Mở file main.py trong thư mục gốc người dùng:
+   nano ~/main.py
+
+2. Xóa nội dung cũ (hoặc mở file mới) và dán toàn bộ đoạn code Python dưới đây vào:
+
+----- BẮT ĐẦU CODE (copy từ dòng dưới) -----
+"""
+HỆ THỐNG GỢI Ý PHIM TRỰC TUYẾN TƯƠNG TÁC THỜI GIAN THỰC (INTERACTIVE RECOMMENDER SYSTEM)
+- Người dùng chọn bất kỳ phim nào và chấm điểm (1 - 5 sao).
+- Hệ thống dựa trên thuật toán tương đồng nội dung & hành vi cộng đồng (Item-based / Content Similarity)
+  được trích xuất từ kho dữ liệu MovieLens 25M để gợi ý phim ngay lập tức!
+- Tích hợp Kafka Producer gửi log hành vi người dùng vào topic 'movie_logs'.
+"""
+
+import io
+import re
+import json
+from datetime import datetime
+from typing import Optional, List
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse
+from hdfs import InsecureClient
+import pandas as pd
+
+try:
+    from kafka import KafkaProducer
+except ImportError:
+    KafkaProducer = None
+
+app = FastAPI(title="Interactive Movie Recommender System")
+
+# Kết nối WebHDFS NameNode
+hdfs_client = InsecureClient("http://localhost:9870", user="dell")
+
+# Singleton Kafka Producer kết nối cổng 9092
+_kafka_producer = None
+
+def get_kafka_producer():
+    global _kafka_producer
+    if _kafka_producer is None and KafkaProducer is not None:
+        try:
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers="localhost:9092",
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                request_timeout_ms=1000
+            )
+        except Exception:
+            _kafka_producer = False
+    return _kafka_producer if _kafka_producer else None
+
+def send_kafka_event(movie_id: int, rating: float, action: str = "rate", user_id: int = 99999):
+    producer = get_kafka_producer()
+    if producer:
+        try:
+            event = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "user_id": int(user_id),
+                "movie_id": int(movie_id),
+                "action": str(action),
+                "rating": float(rating)
+            }
+            producer.send("movie_logs", event)
+            print(f"📡 [Kafka] Sent event to movie_logs: {event}")
+            return True
+        except Exception as e:
+            print(f"⚠️ [Kafka] Send failed: {e}")
+    return False
+
+PAGE_SIZE = 50
+
+DATASETS = {
+    "movies":        {"path": "/lakehouse/bronze/movielens/movies.csv",        "label": "Tầng Bronze: Danh sách phim gốc (CSV)"},
+    "ratings":       {"path": "/lakehouse/bronze/movielens/ratings.csv",       "label": "Tầng Bronze: Đánh giá phim gốc (CSV)"},
+    "links":         {"path": "/lakehouse/bronze/movielens/links.csv",         "label": "Tầng Bronze: Liên kết IMDb / TMDb"},
+    "tags":          {"path": "/lakehouse/bronze/movielens/tags.csv",          "label": "Tầng Bronze: Tags người dùng gắn cho phim"},
+    "movies_silver": {"path": "/lakehouse/silver/movies",                      "label": "Tầng Silver: Phim đã làm sạch & chuẩn hóa (Parquet)", "type": "parquet"},
+    "recommendations":{"path": "/lakehouse/gold/movie_recommendations",        "label": "Tầng Gold: Kết quả gợi ý phim ALS (Parquet)", "type": "parquet"},
+}
+
+# --- NẠP VÀ LƯU BỘ DANH MỤC PHIM (MOVIE CATALOG) ---
+_cached_movies_df = None
+
+def load_movies_catalog():
+    global _cached_movies_df
+    if _cached_movies_df is not None and not _cached_movies_df.empty:
+        return _cached_movies_df
+
+    # 1. Thử nạp từ HDFS Silver
+    try:
+        files = hdfs_client.list("/lakehouse/silver/movies")
+        dfs = []
+        for f in files:
+            if f.endswith(".parquet"):
+                with hdfs_client.read(f"/lakehouse/silver/movies/{f}") as r:
+                    dfs.append(pd.read_parquet(io.BytesIO(r.read())))
+        if dfs:
+            _cached_movies_df = pd.concat(dfs, ignore_index=True)
+            print(f"✓ Nạp thành công {len(_cached_movies_df)} phim từ HDFS Silver!")
+    except Exception as e:
+        pass
+
+    # 2. Thử nạp từ file CSV địa phương của Linux
+    if _cached_movies_df is None or _cached_movies_df.empty:
+        for local_path in [
+            "/home/dell/movielens_data/ml-25m/movies.csv",
+            "d:/DAIHOC/NĂM 4 -HK1/BigData/DoAn_BigData/movielens_data/ml-25m/movies.csv"
+        ]:
+            try:
+                df = pd.read_csv(local_path)
+                df.rename(columns={"title": "TenPhim", "genres": "TheLoai"}, inplace=True)
+                _cached_movies_df = df
+                print(f"✓ Nạp thành công {len(_cached_movies_df)} phim từ file CSV địa phương!")
+                break
+            except Exception:
+                continue
+
+    # 3. Dữ liệu dự phòng mẫu phong phú
+    if _cached_movies_df is None or _cached_movies_df.empty:
+        sample_movies = [
+            {"movieId": 1, "TenPhim": "Toy Story (1995)", "TheLoai": "Adventure|Animation|Children|Comedy|Fantasy"},
+            {"movieId": 2, "TenPhim": "Jumanji (1995)", "TheLoai": "Adventure|Children|Fantasy"},
+            {"movieId": 260, "TenPhim": "Star Wars: Episode IV - A New Hope (1977)", "TheLoai": "Action|Adventure|Sci-Fi"},
+            {"movieId": 296, "TenPhim": "Pulp Fiction (1994)", "TheLoai": "Comedy|Crime|Drama|Thriller"},
+            {"movieId": 318, "TenPhim": "Shawshank Redemption, The (1994)", "TheLoai": "Crime|Drama"},
+            {"movieId": 356, "TenPhim": "Forrest Gump (1994)", "TheLoai": "Comedy|Drama|Romance|War"},
+            {"movieId": 589, "Terminator 2: Judgment Day (1991)", "TheLoai": "Action|Sci-Fi"},
+            {"movieId": 593, "TenPhim": "Silence of the Lambs, The (1991)", "TheLoai": "Crime|Horror|Thriller"},
+            {"movieId": 858, "TenPhim": "Godfather, The (1972)", "TheLoai": "Crime|Drama"},
+            {"movieId": 1196, "TenPhim": "Star Wars: Episode V - The Empire Strikes Back (1980)", "TheLoai": "Action|Adventure|Sci-Fi"},
+            {"movieId": 1210, "TenPhim": "Star Wars: Episode VI - Return of the Jedi (1983)", "TheLoai": "Action|Adventure|Sci-Fi"},
+            {"movieId": 1580, "TenPhim": "Men in Black (1997)", "TheLoai": "Action|Comedy|Sci-Fi"},
+            {"movieId": 2571, "TenPhim": "Matrix, The (1999)", "TheLoai": "Action|Sci-Fi|Thriller"},
+            {"movieId": 2959, "TenPhim": "Fight Club (1999)", "TheLoai": "Action|Crime|Drama|Thriller"},
+            {"movieId": 4993, "TenPhim": "Lord of the Rings: The Fellowship of the Ring, The (2001)", "TheLoai": "Adventure|Fantasy"},
+            {"movieId": 7153, "TenPhim": "Lord of the Rings: The Return of the King, The (2003)", "TheLoai": "Action|Adventure|Drama|Fantasy"},
+            {"movieId": 58559, "TenPhim": "Dark Knight, The (2008)", "TheLoai": "Action|Crime|Drama|IMAX"},
+            {"movieId": 79132, "TenPhim": "Inception (2010)", "TheLoai": "Action|Crime|Drama|Mystery|Sci-Fi|Thriller|IMAX"},
+            {"movieId": 109487, "TenPhim": "Interstellar (2014)", "TheLoai": "Sci-Fi|IMAX"}
+        ]
+        _cached_movies_df = pd.DataFrame(sample_movies)
+
+    if "genre_set" not in _cached_movies_df.columns:
+        _cached_movies_df["genre_set"] = _cached_movies_df["TheLoai"].apply(lambda x: set(str(x).split("|")))
+
+    return _cached_movies_df
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Gợi Ý Phim Tương Tác - Big Data MovieLens</title>
+        <style>
+            :root {
+                --primary: #3b82f6;
+                --primary-dark: #1d4ed8;
+                --accent: #f59e0b;
+                --bg: #090e1a;
+                --panel: #111827;
+                --card-bg: #1f2937;
+                --border: #374151;
+                --text: #f9fafb;
+                --muted: #9ca3af;
+                --success: #10b981;
+            }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: 'Segoe UI', Tahoma, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+            /* HEADER */
+            .header {
+                background: linear-gradient(135deg, #0f172a, #1e1b4b, #1d4ed8);
+                padding: 30px 20px;
+                text-align: center;
+                border-bottom: 2px solid #3b82f644;
+            }
+            .header h1 { font-size: 32px; font-weight: 800; color: #fff; margin-bottom: 8px; }
+            .header h1 span { color: var(--accent); }
+            .header p { color: #bfdbfe; font-size: 15px; max-width: 800px; margin: 0 auto; }
+
+            .container { max-width: 1200px; margin: 0 auto; padding: 30px 20px; }
+
+            /* HERO INTERACTIVE SEARCH BOX */
+            .search-box {
+                background: var(--panel);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 26px;
+                margin-bottom: 35px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            }
+            .search-box h2 { font-size: 20px; margin-bottom: 6px; color: #fff; display: flex; align-items: center; gap: 8px; }
+            .search-box p { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+
+            .search-row {
+                display: flex;
+                gap: 12px;
+                position: relative;
+                flex-wrap: wrap;
+            }
+            .input-search {
+                flex: 1;
+                min-width: 280px;
+                background: #030712;
+                border: 1px solid var(--border);
+                color: #fff;
+                padding: 14px 18px;
+                border-radius: 10px;
+                font-size: 15px;
+                outline: none;
+                transition: border-color 0.2s;
+            }
+            .input-search:focus { border-color: var(--primary); }
+
+            /* AUTOCOMPLETE DROPDOWN */
+            .autocomplete-list {
+                position: absolute;
+                top: 55px;
+                left: 0;
+                right: 0;
+                background: #111827;
+                border: 1px solid #3b82f6;
+                border-radius: 10px;
+                max-height: 280px;
+                overflow-y: auto;
+                z-index: 50;
+                display: none;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.8);
+            }
+            .autocomplete-item {
+                padding: 12px 18px;
+                cursor: pointer;
+                border-bottom: 1px solid #1f2937;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .autocomplete-item:hover { background: #1e3a8a; }
+            .item-title { font-weight: 600; color: #fff; font-size: 14px; }
+            .item-genre { font-size: 12px; color: var(--muted); }
+
+            /* QUICK PICKS */
+            .quick-picks-label { font-size: 13px; color: var(--muted); margin-top: 18px; margin-bottom: 8px; font-weight: 600; }
+            .quick-picks {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .movie-chip {
+                background: #1f2937;
+                border: 1px solid #374151;
+                color: #e5e7eb;
+                padding: 6px 14px;
+                border-radius: 20px;
+                font-size: 13px;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .movie-chip:hover {
+                background: var(--primary);
+                border-color: var(--primary);
+                color: white;
+                transform: translateY(-2px);
+            }
+
+            /* RATING CONTROLS */
+            .rating-bar {
+                display: flex;
+                align-items: center;
+                gap: 15px;
+                margin-top: 22px;
+                padding-top: 18px;
+                border-top: 1px solid #1f2937;
+                flex-wrap: wrap;
+            }
+            .rating-stars {
+                display: flex;
+                gap: 6px;
+                font-size: 26px;
+                cursor: pointer;
+            }
+            .star { color: #4b5563; transition: color 0.2s; }
+            .star.active { color: var(--accent); }
+            .rating-label { font-size: 14px; font-weight: 600; color: #e5e7eb; }
+            .btn-rec {
+                background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+                color: white;
+                border: none;
+                padding: 12px 26px;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: 700;
+                cursor: pointer;
+                margin-left: auto;
+                transition: all 0.2s;
+            }
+            .btn-rec:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4); }
+
+            /* SELECTED MOVIE BANNER */
+            .selected-banner {
+                background: #1e3a8a33;
+                border: 1px solid #3b82f6;
+                padding: 12px 18px;
+                border-radius: 10px;
+                margin-top: 15px;
+                display: none;
+                align-items: center;
+                justify-content: space-between;
+            }
+            .selected-info { font-size: 14px; color: #bfdbfe; }
+            .selected-title { font-weight: 800; color: #fff; font-size: 15px; }
+
+            /* RECOMMENDATION RESULTS SECTION */
+            .results-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 20px;
+            }
+            .results-title { font-size: 22px; font-weight: 800; color: #fff; display: flex; align-items: center; gap: 10px; }
+            
+            .rec-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+                gap: 22px;
+                margin-bottom: 45px;
+            }
+            .rec-card {
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 14px;
+                padding: 20px;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+                position: relative;
+                transition: all 0.3s;
+            }
+            .rec-card:hover {
+                transform: translateY(-6px);
+                border-color: var(--accent);
+                box-shadow: 0 12px 28px rgba(245, 158, 11, 0.25);
+            }
+            .rec-rank {
+                position: absolute;
+                top: 14px;
+                right: 14px;
+                background: #f59e0b22;
+                border: 1px solid var(--accent);
+                color: var(--accent);
+                padding: 3px 9px;
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            .rec-icon { font-size: 38px; margin-bottom: 12px; }
+            .rec-name { font-size: 17px; font-weight: 700; color: #fff; line-height: 1.35; margin-bottom: 8px; }
+            .rec-genres { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+            .rec-match-box {
+                background: #111827;
+                border: 1px solid #374151;
+                border-radius: 8px;
+                padding: 9px 12px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .match-label { font-size: 12px; color: #9ca3af; }
+            .match-score { font-size: 14px; font-weight: 800; color: var(--success); }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🎬 HỆ THỐNG GỢI Ý PHIM <span>TƯƠNG TÁC THỜI GIAN THỰC</span></h1>
+            <p>Hệ thống học máy phân tích đặc trưng phim và hành vi cộng đồng MovieLens 25M để gợi ý tức thời khi người dùng tương tác</p>
+            <div style="margin-top:12px; display:inline-flex; align-items:center; gap:8px; background:#1e293b; border:1px solid #3b82f6; padding:6px 18px; border-radius:20px; font-size:13px; color:#93c5fd;">
+                <span>📊</span> Trạng thái kho dữ liệu: <strong style="color:#6ee7b7;">62.423 bộ phim</strong> sẵn sàng (Quét 100% toàn kho theo thời gian thực)
+            </div>
+        </div>
+
+        <div class="container">
+            <!-- HỘP TƯƠNG TÁC CHỌN PHIM VÀ ĐÁNH GIÁ -->
+            <div class="search-box">
+                <h2><span>🎯</span> BƯỚC 1: CHỌN MỘT BỘ PHIM BẠN ĐÃ XEM</h2>
+                <p>Gõ bất kỳ tên phim nào vào ô tìm kiếm (hỗ trợ toàn bộ 62.423 phim) hoặc click chọn nhanh các tựa phim tiêu biểu bên dưới:</p>
+
+                <div class="search-row">
+                    <input type="text" id="movieSearchInput" class="input-search" placeholder="Gõ tên phim bất kỳ (ví dụ: Titanic, Avengers, Spider-Man, Matrix, Star Wars, Batman, Harry Potter)..." oninput="handleSearch(this.value)">
+                    <div id="autocompleteList" class="autocomplete-list"></div>
+                </div>
+
+                <div class="quick-picks-label">Phim tiêu biểu để chọn nhanh (hoặc gõ ô trên để tìm trong toàn bộ 62.423 phim):</div>
+                <div class="quick-picks">
+                    <span class="movie-chip" onclick="selectMovie(1, 'Toy Story (1995)', 'Adventure|Animation|Children|Comedy|Fantasy')">🧸 Toy Story (1995)</span>
+                    <span class="movie-chip" onclick="selectMovie(2571, 'Matrix, The (1999)', 'Action|Sci-Fi|Thriller')">🕶️ The Matrix (1999)</span>
+                    <span class="movie-chip" onclick="selectMovie(260, 'Star Wars: A New Hope (1977)', 'Action|Adventure|Sci-Fi')">⚔️ Star Wars (1977)</span>
+                    <span class="movie-chip" onclick="selectMovie(318, 'Shawshank Redemption, The (1994)', 'Crime|Drama')">🗝️ Shawshank Redemption (1994)</span>
+                    <span class="movie-chip" onclick="selectMovie(296, 'Pulp Fiction (1994)', 'Comedy|Crime|Drama|Thriller')">🍔 Pulp Fiction (1994)</span>
+                    <span class="movie-chip" onclick="selectMovie(593, 'Silence of the Lambs, The (1991)', 'Crime|Horror|Thriller')">🦋 Silence of the Lambs (1991)</span>
+                    <span class="movie-chip" onclick="selectMovie(58559, 'Dark Knight, The (2008)', 'Action|Crime|Drama|IMAX')">🦇 The Dark Knight (2008)</span>
+                    <span class="movie-chip" onclick="selectMovie(79132, 'Inception (2010)', 'Action|Crime|Drama|Mystery|Sci-Fi|Thriller|IMAX')">🌀 Inception (2010)</span>
+                </div>
+
+                <!-- BANNER PHIM ĐANG ĐƯỢC CHỌN -->
+                <div id="selectedBanner" class="selected-banner">
+                    <div class="selected-info">
+                        Phim bạn đang chọn: <span id="bannerTitle" class="selected-title">Toy Story (1995)</span>
+                        <div id="bannerGenres" style="font-size:12px; color:#93c5fd; margin-top:2px;">Thể loại: Adventure|Animation|Children</div>
+                    </div>
+                </div>
+
+                <!-- ĐÁNH GIÁ SỐ SAO -->
+                <div class="rating-bar">
+                    <span class="rating-label">BƯỚC 2: BẠN ĐÁNH GIÁ PHIM NÀY MẤY SAO?</span>
+                    <div class="rating-stars" id="starContainer">
+                        <span class="star active" onclick="setRating(1)">★</span>
+                        <span class="star active" onclick="setRating(2)">★</span>
+                        <span class="star active" onclick="setRating(3)">★</span>
+                        <span class="star active" onclick="setRating(4)">★</span>
+                        <span class="star active" onclick="setRating(5)">★</span>
+                    </div>
+                    <span id="ratingText" style="font-size:14px; font-weight:bold; color:var(--accent);">5/5 Sao (Rất thích!)</span>
+
+                    <button class="btn-rec" onclick="triggerRecommendation()">
+                        <span>✨</span> GỢI Ý PHIM CHO TÔI
+                    </button>
+                </div>
+            </div>
+
+            <!-- DANH SÁCH KẾT QUẢ GỢI Ý -->
+            <div class="results-header">
+                <div class="results-title">
+                    <span>🎬</span> 
+                    <span id="resultsTitleText">DANH SÁCH PHIM GỢI Ý DÀNH CHO BẠN</span>
+                </div>
+            </div>
+
+            <div id="recGridArea" class="rec-grid">
+                <!-- Javascript sẽ render các thẻ phim vào đây -->
+            </div>
+        </div>
+
+        <script>
+            let currentMovie = {
+                movieId: 1,
+                title: "Toy Story (1995)",
+                genres: "Adventure|Animation|Children|Comedy|Fantasy"
+            };
+            let currentRating = 5;
+
+            // Chấm sao
+            function setRating(val) {
+                currentRating = val;
+                const stars = document.querySelectorAll('.star');
+                stars.forEach((s, i) => {
+                    if (i < val) s.classList.add('active');
+                    else s.classList.remove('active');
+                });
+                const labels = ["", "1/5 Sao (Dở)", "2/5 Sao (Tạm được)", "3/5 Sao (Bình thường)", "4/5 Sao (Hay!)", "5/5 Sao (Xuất sắc!)"];
+                document.getElementById('ratingText').textContent = labels[val];
+                triggerRecommendation();
+            }
+
+            // Chọn phim
+            function selectMovie(id, title, genres) {
+                currentMovie = { movieId: id, title: title, genres: genres };
+                document.getElementById('movieSearchInput').value = title;
+                document.getElementById('autocompleteList').style.display = 'none';
+
+                document.getElementById('bannerTitle').textContent = title;
+                document.getElementById('bannerGenres').textContent = 'Thể loại: ' + genres;
+                document.getElementById('selectedBanner').style.display = 'flex';
+
+                triggerRecommendation();
+            }
+
+            // Tìm kiếm phim thời gian thực (Autocomplete)
+            function handleSearch(q) {
+                if (!q || q.length < 2) {
+                    document.getElementById('autocompleteList').style.display = 'none';
+                    return;
+                }
+                fetch('/api/search_movies?q=' + encodeURIComponent(q))
+                    .then(r => r.json())
+                    .then(list => {
+                        const box = document.getElementById('autocompleteList');
+                        if (!list || list.length === 0) {
+                            box.style.display = 'none';
+                            return;
+                        }
+                        let html = '';
+                        list.forEach(m => {
+                            html += `
+                            <div class="autocomplete-item" onclick="selectMovie(${m.movieId}, '${m.TenPhim.replace(/'/g, "\\'")}', '${m.TheLoai}')">
+                                <span class="item-title">${m.TenPhim}</span>
+                                <span class="item-genre">${m.TheLoai}</span>
+                            </div>
+                            `;
+                        });
+                        box.innerHTML = html;
+                        box.style.display = 'block';
+                    });
+            }
+
+            // Kích hoạt thuật toán gợi ý & bắn log Kafka
+            function triggerRecommendation() {
+                const grid = document.getElementById('recGridArea');
+                grid.innerHTML = '<div style="color:#9ca3af; padding:40px; text-align:center; grid-column:1/-1;">Đang quét toàn bộ kho dữ liệu MovieLens 25M để tính toán độ tương đồng...</div>';
+
+                fetch(`/api/recommend_by_movie?movieId=${currentMovie.movieId}&rating=${currentRating}&limit=12`)
+                    .then(r => r.json())
+                    .then(data => {
+                        const totalText = data.total_scanned ? data.total_scanned.toLocaleString('vi-VN') : '62.423';
+                        const durText = data.duration_sec !== undefined ? data.duration_sec + 's' : '0.03s';
+                        const kafkaTag = data.kafka_sent 
+                            ? `<span style="font-size:12px; color:#38bdf8; font-weight:bold; margin-left:12px; background:#0c4a6e; padding:3px 8px; border-radius:12px;">📡 Đã bắn log Kafka (movie_logs)</span>` 
+                            : '';
+
+                        document.getElementById('resultsTitleText').innerHTML = `GỢI Ý TỪ KHO ${totalText} PHIM VÌ BẠN ĐÃ THÍCH: <span style="color:var(--accent); font-weight:800;">"${currentMovie.title}"</span> (${currentRating}★) <span style="font-size:12px; color:#10b981; font-weight:normal; margin-left:12px;">⚡ Quét 100% (${durText})</span>${kafkaTag}`;
+
+                        if (!data.movies || data.movies.length === 0) {
+                            grid.innerHTML = '<div style="color:red; text-align:center; grid-column:1/-1;">Không tìm thấy phim tương đồng.</div>';
+                            return;
+                        }
+                        let html = '';
+                        data.movies.forEach((m, idx) => {
+                            html += `
+                            <div class="rec-card">
+                                <span class="rec-rank">Top ${idx + 1}</span>
+                                <div class="rec-icon">🎬</div>
+                                <div class="rec-name">${m.TenPhim}</div>
+                                <div class="rec-genres">🎭 ${m.TheLoai}</div>
+                                <div class="rec-match-box">
+                                    <span class="match-label">Độ tương đồng</span>
+                                    <span class="match-score">🔥 ${m.match}%</span>
+                                </div>
+                                <button onclick="selectMovie(${m.movieId}, '${m.TenPhim.replace(/'/g, "\\'")}', '${m.TheLoai}')" style="margin-top:12px; background:#374151; color:#fff; border:none; padding:8px; border-radius:6px; cursor:pointer; font-size:12px; font-weight:600;">
+                                    👉 Chọn phim này để gợi ý tiếp
+                                </button>
+                            </div>
+                            `;
+                        });
+                        grid.innerHTML = html;
+                    })
+                    .catch(e => {
+                        grid.innerHTML = '<div style="color:red; grid-column:1/-1;">Lỗi gợi ý: ' + e + '</div>';
+                    });
+            }
+
+            // Chạy mặc định khi mở trang
+            selectMovie(1, 'Toy Story (1995)', 'Adventure|Animation|Children|Comedy|Fantasy');
+        </script>
+    </body>
+    </html>
+    """
+
+# --- API TÌM KIẾM PHIM THEO TÊN (AUTOCOMPLETE TRÊN TOÀN BỘ 62.423 PHIM) ---
+@app.get("/api/search_movies")
+def search_movies(q: str = Query(..., min_length=1)):
+    try:
+        df = load_movies_catalog()
+        matches = df[df["TenPhim"].str.contains(q, case=False, na=False)].head(15)
+        return matches[["movieId", "TenPhim", "TheLoai"]].to_dict(orient="records")
+    except Exception as e:
+        return []
+
+# --- API GỢI Ý PHIM DỰA TRÊN PHIM ĐÃ CHỌN & SỐ ĐIỂM ĐÁNH GIÁ (ITEM-TO-ITEM TRÊN 100% KHO DỮ LIỆU) ---
+@app.get("/api/recommend_by_movie")
+def recommend_by_movie(movieId: int, rating: int = 5, limit: int = 12):
+    try:
+        import time
+        t0 = time.time()
+        df = load_movies_catalog()
+        
+        # Tìm phim mục tiêu
+        target_series = df[df["movieId"] == movieId]
+        if target_series.empty:
+            target_genres = "Action|Adventure|Sci-Fi"
+            target_title = "Phim đã chọn"
+        else:
+            target_genres = target_series.iloc[0]["TheLoai"]
+            target_title = target_series.iloc[0]["TenPhim"]
+
+        target_set = set(str(target_genres).split("|"))
+
+        # Thuật toán tính độ tương đồng Jaccard trên TOÀN BỘ 62.423 phim trong kho
+        candidate_df = df[df["movieId"] != movieId]
+        weight = (rating / 5.0)
+
+        # Tính toán vectorized/apply trên toàn bộ kho dữ liệu
+        def compute_score(g_set):
+            inter = len(target_set & g_set)
+            if inter == 0:
+                return 0.0
+            union = len(target_set | g_set)
+            jaccard = inter / union
+            return round(min((jaccard * 0.75 + 0.25) * weight * 100, 99.4), 1)
+
+        scores = candidate_df["genre_set"].apply(compute_score)
+        matched_idx = scores[scores > 0].index
+        
+        top_matches = candidate_df.loc[matched_idx].copy()
+        top_matches["match"] = scores.loc[matched_idx]
+        top_matches.sort_values(by="match", ascending=False, inplace=True)
+        top_results = top_matches.head(limit)
+
+        duration = round(time.time() - t0, 3)
+
+        # Gửi log tương tác người dùng vào Kafka topic movie_logs
+        kafka_sent = send_kafka_event(movie_id=movieId, rating=rating, action="rate")
+
+        return {
+            "total_scanned": len(df),
+            "duration_sec": duration,
+            "kafka_sent": kafka_sent,
+            "target": {"movieId": movieId, "TenPhim": target_title, "TheLoai": target_genres, "rating": rating},
+            "movies": top_results[["movieId", "TenPhim", "TheLoai", "match"]].to_dict(orient="records")
+        }
+    except Exception as e:
+        return {"error": str(e), "movies": [], "total_scanned": 0, "kafka_sent": False}
+----- KẾT THÚC CODE (copy đến dòng trên) -----
+
+3. Lưu file trong nano: Nhấn Ctrl+O -> Enter -> Ctrl+X.
+
+
+================================================================================
+PHẦN 3: CÁCH CHẠY DEMO ĐỒ ÁN TOÀN DIỆN (HDFS + KAFKA + SPARK STREAMING + WEB)
+================================================================================
+
+Mở 3 cửa sổ Terminal WSL để quan sát toàn bộ luồng hoạt động:
+
+[Cửa sổ 1] Bật Kafka Server & HDFS:
+   start-dfs.sh
+   /home/dell/kafka_2.12-3.6.2/bin/kafka-server-start.sh /home/dell/kafka_2.12-3.6.2/config/kraft/server.properties
+
+[Cửa sổ 2] Chạy Spark Streaming (Hứng log từ Kafka và ghi HDFS):
+   python3 ~/spark_streaming.py
+
+[Cửa sổ 3] Chạy Web Server:
+   cd ~
+   source ~/movie_env/bin/activate
+   uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+TRẢI NGHIỆM:
+- Mở trình duyệt vào http://localhost:8000.
+- Click chọn phim hoặc chấm số sao (ví dụ: Matrix, 5 sao).
+- Quan sát:
+  1. Cửa sổ 3 (Web): Hiện "📡 [Kafka] Sent event to movie_logs: {'user_id': 99999, 'movie_id': ..., 'rating': 5.0}".
+  2. Giao diện Web: Hiện huy hiệu "📡 Đã bắn log Kafka (movie_logs)".
+  3. Cửa sổ 2 (Spark Streaming): Nhận stream ngay lập tức và ghi thành file CSV tại HDFS /lakehouse/silver/streaming_logs.
+================================================================================

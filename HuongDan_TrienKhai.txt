@@ -1,0 +1,151 @@
+# HƯỚNG DẪN TRIỂN KHAI HỆ THỐNG BIG DATA (MÔ HÌNH LAKEHOUSE)
+# Đề tài: Hệ thống gợi ý phim trên nền tảng phim trực tuyến
+# Môi trường: WSL (Windows Subsystem for Linux) - Lưu trữ trên ổ cứng tùy chọn (VD: Ổ D)
+
+Lưu ý: Các đoạn nằm trong dấu <...> là phần bạn cần thay thế cho đúng với máy tính của mình.
+
+================================================================================
+PHẦN 1: TẠO VÀ LƯU MÁY ẢO LINUX (Thực hiện trên Windows PowerShell)
+================================================================================
+(Ghi chú: Bạn nên chọn ổ đĩa nào còn trống nhiều dung lượng, ví dụ ổ C, D, E...)
+
+1. Tạo thư mục để chứa toàn bộ dữ liệu máy ảo:
+   mkdir <Đường_dẫn_thư_mục_chứa_máy_ảo>
+   (Ví dụ: mkdir C:\Ubuntu_BigData hoặc mkdir D:\Ubuntu_BigData)
+
+2. Nạp (Import) file cài đặt Linux vào thư mục vừa tạo:
+   wsl --import Ubuntu-26.04 <Đường_dẫn_thư_mục_chứa_máy_ảo> "<Đường_dẫn_tới_file_ubuntu_của_bạn.wsl>"
+   (Ví dụ: wsl --import Ubuntu-26.04 C:\Ubuntu_BigData "E:\Setup\ubuntu-26.04.1-wsl-amd64.wsl")
+
+3. Khởi động máy ảo vừa tạo:
+   wsl -d Ubuntu-26.04
+
+
+================================================================================
+PHẦN 2: THIẾT LẬP TÀI KHOẢN VÀ CÔNG CỤ (Thực hiện trong Terminal của Ubuntu)
+================================================================================
+
+1. Tạo tài khoản người dùng an toàn (Thay <tên_user> bằng tên bạn muốn, VD: hadoopuser):
+   adduser <tên_user>
+   usermod -aG sudo <tên_user>
+   su - <tên_user>
+
+2. Cài đặt Java 8 và công cụ mạng (SSH, Unzip):
+   sudo apt update -y
+   sudo apt install openjdk-8-jdk openssh-server openssh-client unzip -y
+
+3. Cấu hình tự động đăng nhập SSH (Bắt buộc cho Hadoop):
+   ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa
+   cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+   chmod 0600 ~/.ssh/authorized_keys
+
+4. Test SSH (Gõ 'yes' nếu được hỏi):
+   ssh localhost
+   (Sau đó gõ `exit` để thoát khỏi phiên test và quay lại dòng lệnh thường)
+
+
+================================================================================
+PHẦN 3: CÀI ĐẶT VÀ CẤU HÌNH HADOOP (HDFS)
+================================================================================
+
+1. Tải và giải nén Hadoop 3.3.6:
+   wget https://dlcdn.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+   tar -xzvf hadoop-3.3.6.tar.gz
+   sudo mv hadoop-3.3.6 /usr/local/hadoop
+
+2. Gắn Biến môi trường hệ thống:
+   - Mở file: nano ~/.bashrc
+   - Dán khối sau vào CUỐI file:
+        export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+        export HADOOP_HOME=/usr/local/hadoop
+        export HADOOP_INSTALL=$HADOOP_HOME
+        export HADOOP_MAPRED_HOME=$HADOOP_HOME
+        export HADOOP_COMMON_HOME=$HADOOP_HOME
+        export HADOOP_HDFS_HOME=$HADOOP_HOME
+        export YARN_HOME=$HADOOP_HOME
+        export HADOOP_COMMON_LIB_NATIVE_DIR=$HADOOP_HOME/lib/native
+        export PATH=$PATH:$HADOOP_HOME/sbin:$HADOOP_HOME/bin
+   - Lưu lại (Ctrl+O -> Enter -> Ctrl+X) và Áp dụng ngay: 
+     source ~/.bashrc
+
+3. Cấu hình các file lõi của Hadoop:
+   a) File: nano /usr/local/hadoop/etc/hadoop/hadoop-env.sh
+      Tìm và sửa dòng có chữ JAVA_HOME thành:
+      export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+
+   b) File: nano /usr/local/hadoop/etc/hadoop/core-site.xml
+      Dán vào giữa cặp <configuration> và </configuration>:
+        <property>
+          <name>fs.defaultFS</name>
+          <value>hdfs://localhost:9000</value>
+        </property>
+
+   c) File: nano /usr/local/hadoop/etc/hadoop/hdfs-site.xml
+      Dán vào giữa cặp <configuration> và </configuration>:
+        <property>
+          <name>dfs.replication</name>
+          <value>1</value>
+        </property>
+        <property>
+          <name>dfs.namenode.name.dir</name>
+          <value>file:///usr/local/hadoop/data/namenode</value>
+        </property>
+        <property>
+          <name>dfs.datanode.data.dir</name>
+          <value>file:///usr/local/hadoop/data/datanode</value>
+        </property>
+
+4. Format ổ đĩa HDFS (Chỉ làm 1 lần duy nhất lúc cài đặt):
+   hdfs namenode -format
+
+5. Bật hệ thống và kiểm tra:
+   start-dfs.sh
+   jps
+   (Thấy in ra NameNode, DataNode, SecondaryNameNode là thành công. Có thể mở Chrome vào http://localhost:9870 để xem)
+
+
+================================================================================
+PHẦN 4: TẢI VÀ ĐƯA DỮ LIỆU MOVIELENS 25M LÊN HDFS (TẦNG BRONZE)
+================================================================================
+
+1. Tải bộ dữ liệu dạng nén (archive.zip) từ Kaggle về máy Windows: 
+   Link: https://www.kaggle.com/datasets/garymk/movielens-25m-dataset
+
+2. Giải nén dữ liệu vào Linux (Ổ C của Windows trong Linux được hiểu là /mnt/c/):
+   unzip "<Đường_dẫn_tới_file_archive.zip_mà_bạn_vừa_tải_trên_Windows>" -d movielens_data
+   (Ví dụ: unzip "/mnt/c/Users/TênCủaBạn/Downloads/archive.zip" -d movielens_data)
+
+3. Đưa dữ liệu lên Hệ thống phân tán HDFS:
+   hdfs dfs -mkdir -p /lakehouse/bronze/movielens/
+   hdfs dfs -put movielens_data/ml-25m/movies.csv /lakehouse/bronze/movielens/
+   hdfs dfs -put movielens_data/ml-25m/ratings.csv /lakehouse/bronze/movielens/
+
+4. Kiểm tra thành quả xem đã lên Cloud chưa:
+   hdfs dfs -ls -h /lakehouse/bronze/movielens/
+
+
+================================================================================
+PHẦN 5: XÂY DỰNG GIAO DIỆN WEB TEST NHANH (FastAPI)
+================================================================================
+
+1. Tạo môi trường Python:
+   sudo apt install python3-venv -y
+   python3 -m venv movie_env
+   source movie_env/bin/activate
+
+2. Cài thư viện:
+   pip install fastapi uvicorn hdfs pandas
+
+3. Khởi chạy Server Backend:
+   (Viết code bằng file main.py và chạy lệnh `uvicorn main:app --reload`. Mở trình duyệt Windows vào http://localhost:8000 để xem kết quả)
+
+
+================================================================================
+PHỤ LỤC: CÁC LỆNH QUẢN TRỊ HẰNG NGÀY BẠN CẦN NHỚ
+================================================================================
+
+- Mở máy ảo khi vừa bật máy tính Windows: wsl -d Ubuntu-26.04
+- Khởi động HDFS (Bắt buộc phải làm mỗi khi mở máy): start-dfs.sh
+- Tắt HDFS (Để giải phóng RAM cho Windows): stop-dfs.sh
+- Xem thử 10 dòng đầu tiên của file dữ liệu trên HDFS: 
+  hdfs dfs -cat /lakehouse/bronze/movielens/movies.csv | head -n 10

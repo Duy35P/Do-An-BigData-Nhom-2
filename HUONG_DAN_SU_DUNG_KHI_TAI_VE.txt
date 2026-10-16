@@ -1,0 +1,97 @@
+================================================================================
+HƯỚNG DẪN BẮT ĐẦU VÀ SỬ DỤNG KHI TẢI THƯ MỤC DỰ ÁN VỀ
+(DÀNH CHO THÀNH VIÊN NHẬN DỰ ÁN TIẾP TỤC SAU BƯỚC 5)
+ĐỀ TÀI: HỆ THỐNG GỢI Ý PHIM DỰA TRÊN LAKEHOUSE VÀ ĐIỆN TOÁN PHÂN TÁN
+================================================================================
+
+Chào bạn! Đây là gói mã nguồn và tài liệu hoàn thiện của Đồ án Big Data Nhóm 2.
+Nếu bạn đã hoàn thành xong "HuongDan_5_LamSach_Va_HuanLuyen_ALS.txt" (máy đã có
+Hadoop HDFS và Kafka), bạn chỉ cần làm theo các bước cực kỳ đơn giản dưới đây
+để chạy toàn bộ hệ thống trên máy của mình.
+
+================================================================================
+BƯỚC 1: GIẢI NÉN VÀ ĐẶT THƯ MỤC
+================================================================================
+1. Giải nén thư mục này vào một ổ đĩa trên máy tính của bạn (khuyên dùng ổ D,
+   ví dụ: D:\DoAn_BigData hoặc giữ nguyên đường dẫn hiện tại).
+2. Lưu ý: Đảm bảo đường dẫn thư mục không chứa ký tự tiếng Việt có dấu lạ để các
+   file batch script (.bat) không bị lỗi đường dẫn khi click.
+
+================================================================================
+BƯỚC 2: SAO CHÉP MÃ NGUỒN VÀO MÁY ẢO LINUX (WSL)
+================================================================================
+Mở PowerShell trên Windows, đăng nhập vào WSL bằng lệnh:
+   wsl -d Ubuntu-26.04 -u dell
+
+(Nếu bạn dùng bản Ubuntu khác hoặc user khác, hãy đổi tên cho phù hợp).
+
+Sau khi vào terminal Linux, chạy 4 lệnh sau để copy mã nguồn vào thư mục gốc:
+
+1. Di chuyển về thư mục gốc của Linux:
+   cd ~
+
+2. Sao chép file Web Server (main.py) và các script vận hành:
+   (Thay đường dẫn /mnt/d/... bên dưới trỏ đúng vào thư mục bạn vừa giải nén):
+   cp /mnt/d/.../src/main.py ~/main.py
+   cp /mnt/d/.../*.py ~/
+   cp /mnt/d/.../*.sh ~/
+   chmod +x ~/start_all.sh ~/stop_all.sh
+
+3. Sao chép file Airflow DAG vào thư mục dags:
+   mkdir -p ~/airflow/dags
+   cp /mnt/d/.../airflow/dags/*.py ~/airflow/dags/
+
+================================================================================
+BƯỚC 3: CÀI ĐẶT CÁC THƯ VIỆN PYTHON PHỤC VỤ WEB & KAFKA
+================================================================================
+Tại terminal Linux trong WSL, kích hoạt môi trường ảo Python của đồ án:
+   source ~/movie_env/bin/activate
+
+Cài đặt các gói thư viện cần thiết (nếu máy bạn chưa có):
+   pip install fastapi uvicorn kafka-python-ng hdfs pandas --default-timeout=1000
+
+================================================================================
+BƯỚC 4: KHỞI ĐỘNG HỆ THỐNG BẰNG 1-CLICK
+================================================================================
+Bạn KHÔNG CẦN phải mở 3-4 cửa sổ terminal để gõ lệnh thủ công nữa!
+
+1. Trên Windows:
+   - Vào thư mục giải nén, nhấp đúp chuột vào file:
+     👉 START_SYSTEM.bat
+     (Hoặc nhấp chuột phải vào START_SYSTEM.ps1 -> chọn "Run with PowerShell").
+
+2. Chờ khoảng 10 - 15 giây:
+   - Script sẽ tự động bật: Hadoop NameNode + 2 DataNodes, Apache Kafka KRaft (cổng 9092),
+     và máy chủ Web FastAPI Uvicorn (cổng 8000).
+   - Khi hoàn tất, TRÌNH DUYỆT SẼ TỰ ĐỘNG MỞ TẠI ĐỊA CHỈ:
+     👉 http://localhost:8000
+
+================================================================================
+BƯỚC 5: TÀI LIỆU CẦN ĐỌC ĐỂ HIỂU VÀ DEMO DỰ ÁN
+================================================================================
+Trong thư mục này đã có sẵn 3 tài liệu quan trọng bạn nên đọc:
+
+1. HuongDan_6_HoanThien_HeThong_Va_GiaoDien_NangCao.txt:
+   - Đọc file này để hiểu:
+     + Cách trích xuất ma trận ALS movie_factors vào tầng Gold HDFS.
+     + Cách hoạt động của động cơ gợi ý Hybrid Franchise-Aware (đánh giá 5★) và Contrast Mode (đánh giá 1★).
+     + Cách hoạt động của Mục Phim Yêu Thích (Watchlist) và thuật toán Pseudo-User Vector.
+
+2. HuongDan_Demo_BigData_DonGian.txt:
+   - Đọc file này khi chuẩn bị thuyết trình: Hướng dẫn kịch bản 4 bước ăn điểm Big Data
+     (xem WebHDFS http://localhost:9870, xem luồng Kafka 9092, xem Airflow 8080 và Web 8000).
+
+3. BaoCao_HoanThien_DoAn_BigData_NHOM_2.docx:
+   - File báo cáo Word hoàn chỉnh cuối kỳ của nhóm (đã rà soát và chuẩn hóa mọi số liệu,
+     công thức, hình ảnh minh chứng và bảng biểu). Bạn có thể dùng file này để in ấn hoặc nộp bài.
+
+================================================================================
+BƯỚC 6: TẮT HỆ THỐNG AN TOÀN KHI DÙNG XONG
+================================================================================
+Khi muốn tắt hệ thống để giải phóng RAM:
+- Nhấp đúp chuột vào file:
+  👉 STOP_SYSTEM.bat
+- Mọi tiến trình Hadoop, Kafka, Python Web sẽ được dừng an toàn.
+================================================================================
+CHÚC BẠN THỰC HIỆN THÀNH CÔNG VÀ ĐẠT KẾT QUẢ TỐT TRONG BUỔI BÁO CÁO!
+================================================================================

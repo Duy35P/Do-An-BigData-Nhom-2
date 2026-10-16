@@ -1,0 +1,44 @@
+Đây là lộ trình thực hành chi tiết cho giai đoạn đầu tiên: đưa dữ liệu thô vào hạ tầng phân tán và xây dựng giao diện hiển thị danh mục phim trực tiếp từ kho dữ liệu.
+
+1. Tải và đẩy dữ liệu lên HDFS (Trên Ubuntu)
+
+Khởi động cụm Hadoop (NameNode, DataNode) và thực hiện tuần tự các lệnh sau trên terminal Ubuntu:
+
+Bash
+# Cài đặt Kaggle API để tải dữ liệu tự động
+pip install kaggle
+
+# Tải bộ MovieLens 25M (yêu cầu cấu hình file kaggle.json trước đó)
+kaggle datasets download -d garymk/movielens-25m-dataset
+
+# Giải nén
+unzip movielens-25m-dataset.zip -d movielens_data
+
+HƯỚNG DẪN CÀI ĐẶT UBUNTU TRÊN MÁY ẢO VMWARE VỚI FILE ISO: "E:\ubuntu-22.04.5-desktop-amd64.iso"
+Hướng dẫn thực hiện tiếp sau khi cài máy ẢO xong
+# Tạo thư mục Lakehouse tầng thô (Bronze) trên HDFS
+hdfs dfs -mkdir -p /lakehouse/bronze/movielens/
+
+# Đẩy 2 file quan trọng nhất lên HDFS
+hdfs dfs -put movielens_data/movies.csv /lakehouse/bronze/movielens/
+hdfs dfs -put movielens_data/ratings.csv /lakehouse/bronze/movielens/
+
+# Xác nhận file đã nằm trên hệ thống phân tán
+hdfs dfs -ls -h /lakehouse/bronze/movielens/
+2. Chiến lược kết nối Web với HDFS
+
+HDFS không được thiết kế để phục vụ truy vấn tốc độ cao cho ứng dụng Web. Do đó, để hiển thị kho dữ liệu, bạn có hai cách:
+
+Đọc trực tiếp (Chỉ dùng để test): Backend kết nối thẳng vào HDFS qua cổng WebHDFS (50070/9870), quét file movies.csv và trả về vài trăm dòng đầu tiên.
+
+Đọc qua Serving Database (Chuẩn thực tế): Dùng Spark đọc file movies.csv từ HDFS và đổ vào một cơ sở dữ liệu quan hệ (như MySQL). Backend sẽ truy vấn từ MySQL để hiển thị lên Web.
+
+3. Triển khai Backend và Giao diện (Mô hình Serving Database)
+
+Nếu sử dụng kiến trúc này, luồng phát triển ứng dụng Web của bạn sẽ diễn ra như sau:
+
+Đổ dữ liệu bằng Spark: Khởi tạo một job PySpark ngắn đọc file /lakehouse/bronze/movielens/movies.csv trên HDFS và ghi đè vào bảng movies trong MySQL.
+
+Xây dựng API Backend: Dựng Backend bằng Spring Boot. Trong file cấu hình application.properties, bạn thiết lập chuỗi kết nối trực tiếp đến cơ sở dữ liệu MySQL nội bộ với username là root và để trống mật khẩu để đẩy nhanh tốc độ phát triển và kiểm thử cục bộ. Tạo một REST API GET /api/movies để truy xuất danh sách phim.
+
+Xây dựng Frontend: Sử dụng HTML/JS cơ bản, React, hoặc Vue. Gọi API /api/movies và map dữ liệu trả về thành một dạng bảng (Table) dạng lưới (Grid) hiển thị các thông tin: ID Phim, Tên Phim, và Thể loại (Genres).

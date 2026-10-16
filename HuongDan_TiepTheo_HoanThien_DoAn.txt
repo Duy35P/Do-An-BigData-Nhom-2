@@ -1,0 +1,223 @@
+================================================================================
+HƯỚNG DẪN 6: HOÀN THIỆN TOÀN DIỆN HỆ THỐNG GỢI Ý PHIM,
+MÔ HÌNH ALS TẦNG GOLD NÂNG CAO, WATCHLIST VÀ TỰ ĐỘNG HÓA 1-CLICK
+(TÀI LIỆU TIẾP NỐI HƯỚNG DẪN 5 VÀ HƯỚNG DẪN GIAO DIỆN)
+ĐỀ TÀI: XÂY DỰNG HỆ THỐNG GỢI Ý PHIM TRỰC TUYẾN DỰA TRÊN KIẾN TRÚC LAKEHOUSE VÀ ĐIỆN TOÁN PHÂN TÁN
+================================================================================
+
+TỔNG QUAN ĐỐI CHIẾU TIẾN ĐỘ:
+- Ở "HuongDan_5_LamSach_Va_HuanLuyen_ALS.txt": Đã làm sạch dữ liệu sang Parquet tầng Silver
+  và huấn luyện mô hình ALS để sinh Top 5 phim tĩnh cho 500 người dùng lưu tại HDFS Gold.
+- Ở "HuongDan_GiaoDien.txt": Đã dựng giao diện Web FastAPI cơ bản tra cứu phim và bắn log
+  Kafka bằng thuật toán lọc theo thể loại (Jaccard).
+
+CÁC NỘI DUNG LÀM TIẾP TRONG TÀI LIỆU NÀY (HOÀN THIỆN 100% HỆ THỐNG):
+1. Nâng cấp tầng Gold trên HDFS: Xuất ma trận nhân tử ẩn ALS (movie_factors) để phục vụ
+   động cơ gợi ý tức thời (On-the-fly Recommender), giải quyết triệt để vấn đề Cold-Start.
+2. Động cơ gợi ý Hybrid thông minh (Franchise-Aware & Contrast Strategy):
+   - Đánh giá 5 sao (Similar Mode): Gợi ý chuẩn xác các phần tiếp theo cùng vũ trụ điện ảnh (Star Wars, Matrix...).
+   - Đánh giá 1 sao (Contrast Mode): Đổi khẩu vị 100% sang các kiệt tác điện ảnh ở thể loại đối lập.
+3. Mục Phim Yêu Thích (Watchlist) & Thuật toán ALS Multi-Item Pseudo-User Profile Vector:
+   - Lưu trữ nhiều phim yêu thích của người dùng.
+   - Tổng hợp vector đặc trưng ẩn đại diện cho gu người dùng ảo để gợi ý từ Lakehouse.
+4. Mở rộng luồng Kafka Streaming: Thu nhận sự kiện đa hành động ('rate', 'add_to_watchlist', 'remove_from_watchlist').
+5. Tự động hóa 1-Click: Vận hành toàn bộ cụm Hadoop HDFS 2 DataNodes, Kafka KRaft và Web Server chỉ với 1 click.
+
+================================================================================
+PHẦN 1: NÂNG CẤP TẦNG GOLD HDFS - XUẤT MA TRẬN NHÂN TỬ ẨN ALS (MOVIE_FACTORS)
+================================================================================
+
+1. VẤN ĐỀ CỦA HƯỚNG DẪN 5 CẦN KHẮC PHỤC:
+   - Trong Hướng dẫn 5, lệnh `model.recommendForUserSubset(sample_users, 5)` chỉ sinh Top 5
+     cố định cho 500 người dùng có sẵn trong lịch sử MovieLens.
+   - Khi một người dùng mới vào Web chọn phim, người dùng đó không có `userId` trong tập 500
+     người này (bài toán Cold-Start). Do đó, giao diện không thể tra cứu kết quả ALS từ HDFS.
+
+2. GIẢI PHÁP TIẾP THEO:
+   - Trong file huấn luyện ALS (`train_als_recommendation.py`), trích xuất ma trận nhân tử ẩn
+     của toàn bộ các bộ phim (Item Factors):
+     ```python
+     movie_factors = model.itemFactors  # Gồm 2 cột: id (movieId) và features (vector ẩn 10 chiều)
+     movie_factors.write.mode("overwrite").parquet("hdfs://localhost:9000/lakehouse/gold/movie_factors")
+     ```
+   - Thư mục lưu trên HDFS: `/lakehouse/gold/movie_factors/`
+   - Số lượng phim trích xuất: 19.550 phim có vector ẩn học từ 25 triệu lượt đánh giá.
+   - Dung lượng lưu trữ: ~1.8 MB (định dạng Snappy Parquet phân tán).
+
+3. CÔNG THỨC TÍNH TOÁN COSINE SIMILARITY TỨC THỜI (ON-THE-FLY):
+   - Khi người dùng chọn phim A có vector $\vec{v}_A$, hệ thống tính độ tương đồng Cosine
+     với phim ứng viên B có vector $\vec{v}_B$:
+     $$\text{Cosine}(v_A, v_B) = \frac{\vec{v}_A \cdot \vec{v}_B}{\|\vec{v}_A\| \|\vec{v}_B\|}$$
+   - Điểm số luôn nằm trong khoảng $[0, 1]$, quy đổi sang phần trăm ($0\% - 100\%$), giải quyết
+     hoàn toàn lỗi tràn điểm số > 5.0 (như 7.10 hay 7.89 ở báo cáo tiến độ cũ).
+
+================================================================================
+PHẦN 2: NÂNG CẤP ĐỘNG CƠ GỢI Ý HYBRID (FRANCHISE & CONTRAST)
+================================================================================
+
+1. XỬ LÝ KHI NGƯỜI DÙNG THÍCH PHIM (ĐÁNH GIÁ 3★ - 5★):
+   - Thuật toán bóc tách tiền tố thương hiệu (`extract_franchise_root`):
+     Tự động nhận diện các phim cùng vũ trụ:
+     * "Star Wars: Episode IV..." -> root: "star wars"
+     * "Matrix, The (1999)" -> root: "matrix"
+     * "Lord of the Rings: The Fellowship..." -> root: "lord of the rings"
+     * "Toy Story (1995)" -> root: "toy story"
+   - Cơ chế tính điểm kết hợp:
+     + Nếu cùng Franchise: Ưu tiên điểm cơ sở 95.0 + kết hợp ALS Cosine Similarity.
+       Kết quả đạt 98% - 99.4%, hiển thị ngay ở các vị trí đầu tiên kèm nhãn "🔥 99% HỢP".
+     + Nếu khác Franchise nhưng cùng thể loại & cùng gu người xem ALS: Đạt 80% - 94.5%.
+
+2. XỬ LÝ KHI NGƯỜI DÙNG CHÊ PHIM (ĐÁNH GIÁ 1★ - 2★ - CONTRAST MODE):
+   - Vấn đề: Nếu người dùng đánh giá 1 sao cho "Star Wars", không thể tiếp tục gợi ý
+     "Star Wars: Episode V" hay các phim viễn tưởng tương tự!
+   - Giải pháp:
+     + Tự động loại trừ 100% các phim cùng Franchise và phim có thể loại trùng lặp.
+     + Kích hoạt chế độ "🔄 ĐỔI KHẨU VỊ (CONTRAST MODE)".
+     + Hệ thống đề xuất các **Kiệt tác điện ảnh đỉnh cao ở thể loại đối lập** có điểm IMDb/TMDb
+       xuất sắc nhất:
+       * *The Shawshank Redemption (1994)* - Tâm lý/Tội phạm
+       * *The Godfather (1972)* - Tội phạm/Kinh điển
+       * *Pulp Fiction (1994)* - Hài đen/Tội phạm
+       * *Forrest Gump (1994)* - Chính kịch/Lãng mạn
+       * *The Silence of the Lambs (1991)* - Giật gân/Tâm lý
+     + Giao diện đổi sang tiêu đề cảnh báo màu đỏ "ĐÃ ĐỔI KHẨU VỊ VÌ BẠN KHÔNG THÍCH PHIM NÀY".
+
+================================================================================
+PHẦN 3: TÍNH NĂNG MỤC PHIM YÊU THÍCH (WATCHLIST) & GỢI Ý ĐA PHIM
+================================================================================
+
+1. GIAO DIỆN MỤC PHIM YÊU THÍCH:
+   - Nút "❤️ Yêu thích" xuất hiện trực tiếp trên từng thẻ phim (Movie Card).
+   - Bấm 1 lần: Thêm vào Watchlist, nút chuyển sang màu hồng đậm "❤️ Đã lưu".
+   - Bấm lần 2: Gỡ khỏi Watchlist, nút trở về trạng thái "❤️ Yêu thích".
+   - Thanh điều hướng có Tab riêng: "❤️ Phim Yêu Thích" kèm badge số lượng phim đang lưu.
+   - Nút hành động chính: **"🔮 GỢI Ý TỪ TOÀN BỘ PHIM YÊU THÍCH (ALS LAKEHOUSE)"**.
+
+2. THUẬT TOÁN ALS MULTI-ITEM PSEUDO-USER PROFILE VECTOR:
+   - Bài toán: Người dùng lưu nhiều phim cùng lúc (ví dụ: vừa lưu *Star Wars* vừa lưu *The Matrix*).
+     Làm thế nào để gợi ý phim thỏa mãn gu tổng thể của người dùng?
+   - Bước 1: Trích xuất các vector đặc trưng ẩn $\vec{v}_m$ ($m \in W$) từ tầng Gold trên HDFS
+     cho tất cả các phim trong Watchlist $W$.
+   - Bước 2: Xây dựng **Vector Người Dùng Ảo (Pseudo-User Vector)**:
+     $$\vec{u}_{\text{pseudo}} = \frac{1}{|W|} \sum_{m \in W} \vec{v}_m, \quad \hat{u} = \frac{\vec{u}_{\text{pseudo}}}{\|\vec{u}_{\text{pseudo}}\|}$$
+   - Bước 3: Tính Cosine Similarity giữa vector người dùng ảo $\hat{u}$ với toàn bộ hơn 62.000 phim
+     trong catalog.
+   - Bước 4: **Lọc bỏ 100% các phim đã có trong Watchlist** để tránh gợi ý lại phim người dùng đã chọn.
+   - Kết quả: Khi lưu cả *Star Wars* và *The Matrix*, danh sách gợi ý sẽ đưa ra các phần tiếp theo
+     của cả 2 bộ phim (*Return of the Jedi*, *The Force Awakens*, *The Empire Strikes Back*, *Matrix Reloaded*...).
+
+================================================================================
+PHẦN 4: ĐỒNG BỘ STREAMING KAFKA THỜI GIAN THỰC 2 CHIỀU ĐA HÀNH VI
+================================================================================
+
+1. MỞ RỘNG CÁC LOẠI SỰ KIỆN KAFKA (TOPIC: movie_logs):
+   - Thay vì chỉ có 1 hành vi `rate` như trong Hướng dẫn Giao diện, hệ thống mở rộng hỗ trợ:
+     + `action: "rate"`: Người dùng đánh giá sao phim (kèm giá trị `rating: 1.0 -> 5.0`).
+     + `action: "add_to_watchlist"`: Người dùng thêm phim vào mục yêu thích (`rating: null`).
+     + `action: "remove_from_watchlist"`: Người dùng bỏ lưu phim (`rating: null`).
+   - Cấu trúc bản tin JSON gửi vào Kafka Broker port 9092:
+     ```json
+     {
+       "timestamp": "2026-10-12 12:47:42",
+       "user_id": 99999,
+       "movie_id": 58559,
+       "action": "add_to_watchlist",
+       "movie_title": "The Dark Knight",
+       "rating": null
+     }
+     ```
+
+2. BẢNG THEO DÕI LIVE STREAMING LOGS TRÊN WEB:
+   - Hiển thị tình trạng kết nối Kafka: `✓ KẾT NỐI KAFKA BROKER: PORT 9092 (BÌNH THƯỜNG)`.
+   - Hiển thị tổng số sự kiện đã thu nhận và điểm đánh giá trung bình (đã lọc các sự kiện null).
+   - Tự động cập nhật mỗi 3 giây bảng nhật ký các sự kiện vừa phát sinh.
+
+================================================================================
+PHẦN 5: TỰ ĐỘNG HÓA 1-CLICK KHỞI ĐỘNG VÀ DỪNG TOÀN BỘ CỤM PHÂN TÁN
+================================================================================
+
+1. VẤN ĐỀ CỦA HƯỚNG DẪN CŨ:
+   - Trong Hướng dẫn Giao diện Phần 3, bạn phải mở 3 cửa sổ terminal riêng biệt và gõ từng lệnh
+     khởi động HDFS, Kafka, Uvicorn rất tốn thời gian và dễ nhầm lẫn.
+
+2. CÁC FILE SCRIPT TỰ ĐỘNG ĐÃ ĐƯỢC TẠO SẴN TRONG DỰ ÁN:
+   - File khởi động Windows: `START_SYSTEM.bat` và `START_SYSTEM.ps1`
+   - File tắt hệ thống Windows: `STOP_SYSTEM.bat` và `STOP_SYSTEM.ps1`
+   - File khởi động Linux trong WSL: `/home/dell/start_all.sh`
+   - File tắt hệ thống Linux trong WSL: `/home/dell/stop_all.sh`
+   - Shortcut tiện ích ngoài Desktop: `C:\Users\Dell\Desktop\START_BIGDATA_SYSTEM.lnk`
+
+3. CÁCH KHỞI ĐỘNG HỆ THỐNG CHỈ VỚI 1 CLICK:
+   - Cách 1: Ra màn hình Desktop Windows, nhấp đúp vào biểu tượng `START_BIGDATA_SYSTEM.lnk`.
+   - Cách 2: Mở thư mục dự án và nhấp chuột phải vào `START_SYSTEM.bat` -> chọn Run.
+   - Cách 3: Chạy từ PowerShell:
+     `powershell -ExecutionPolicy Bypass -File "D:\DAIHOC\NĂM 4 -HK1\BigData\DoAn_BigData\START_SYSTEM.ps1"`
+
+   *Quy trình tự động thực hiện sau khi click:*
+   1. Kiểm tra và khởi động Hadoop HDFS NameNode + DataNode 1.
+   2. Khởi động độc lập DataNode 2 (Cụm 2 Live Nodes).
+   3. Khởi động Apache Kafka KRaft Broker (port 9092) và tạo topic `movie_logs`.
+   4. Khởi động máy chủ Web FastAPI Uvicorn (port 8000).
+   5. Tự động bật trình duyệt web truy cập `http://localhost:8000`.
+
+4. CÁCH TẮT TOÀN BỘ HỆ THỐNG AN TOÀN:
+   - Nhấp đúp vào `STOP_SYSTEM.bat` (hoặc chạy `STOP_SYSTEM.ps1`).
+   - Mọi tiến trình Java, Hadoop, Kafka, Python Uvicorn sẽ được dừng an toàn, tránh lỗi hỏng dữ liệu.
+
+================================================================================
+PHẦN 6: KỊCH BẢN THUYẾT TRÌNH VÀ DEMO TRỰC TIẾP TRƯỚC GIẢNG VIÊN
+================================================================================
+
+Khi báo cáo hoặc thuyết trình đồ án, hãy thực hiện theo đúng 6 bước kịch bản sau:
+
+BƯỚC 1: KHỞI ĐỘNG HỆ THỐNG BẰNG 1-CLICK
+- Mở Desktop, nhấp đúp vào `START_BIGDATA_SYSTEM.lnk`.
+- Thuyết minh: "Hệ sinh thái Big Data gồm Hadoop HDFS 2 DataNodes, Apache Kafka KRaft và FastAPI
+  được tự động hóa khởi động chỉ với 1-click script."
+
+BƯỚC 2: GIỚI THIỆU GIAO DIỆN VÀ TÌM KIẾM PHIM
+- Trình duyệt tự mở tại `http://localhost:8000`.
+- Thuyết minh: "Hệ thống phục vụ kho dữ liệu MovieLens 25M gồm 62.423 bộ phim, tích hợp hiển thị
+  poster chính thức từ TMDb API chuẩn tỷ lệ Netflix."
+- Nhập vào ô tìm kiếm: "Star Wars" -> Chọn bộ phim:
+  *Star Wars: Episode IV - A New Hope (1977)*.
+
+BƯỚC 3: DEMO GỢI Ý 5 SAO (SIMILAR MODE & FRANCHISE-AWARE)
+- Nhấp chọn **5★** cho phim Star Wars.
+- Quan sát kết quả gợi ý trả về tức thì:
+  1. *Star Wars: Episode VI - Return of the Jedi* (🔥 99.4% Hợp)
+  2. *Star Wars: Episode V - The Empire Strikes Back* (🔥 99.2% Hợp)
+  3. *Rogue One: A Star Wars Story* (🔥 99.0% Hợp)
+- Thuyết minh: "Mô hình nhận diện chính xác cùng vũ trụ điện ảnh và kết hợp vector đặc trưng ẩn ALS
+  tầng Gold để đưa toàn bộ các phần tiếp theo lên vị trí ưu tiên cao nhất."
+
+BƯỚC 4: DEMO ĐỔI KHẨU VỊ KHI CHÊ PHIM 1 SAO (CONTRAST MODE)
+- Giữ nguyên phim Star Wars, chuyển số sao đánh giá sang **1★**.
+- Quan sát: Tiêu đề chuyển sang màu đỏ "ĐÃ ĐỔI KHẨU VỊ VÌ BẠN KHÔNG THÍCH PHIM NÀY".
+- Danh sách gợi ý thay đổi 100%: Xuất hiện các kiệt tác thể loại đối lập:
+  *The Shawshank Redemption*, *The Godfather*, *Pulp Fiction*...
+- Thuyết minh: "Khi người dùng chê phim 1 sao, hệ thống áp dụng chiến lược Contrast Mode, loại bỏ
+  hoàn toàn phim cùng thể loại viễn tưởng và đề xuất sang các tác phẩm kinh điển được cộng đồng
+  đánh giá cao nhất."
+
+BƯỚC 5: DEMO MỤC PHIM YÊU THÍCH (WATCHLIST) VÀ GỢI Ý ĐA PHIM ALS
+- Bấm nút "❤️ Yêu thích" ở phim *Star Wars: Episode IV* và *Matrix, The (1999)*.
+- Chuyển sang Tab "❤️ Phim Yêu Thích" -> Thấy 2 bộ phim đã lưu.
+- Nhấp nút **"🔮 GỢI Ý TỪ TOÀN BỘ PHIM YÊU THÍCH (ALS LAKEHOUSE)"**.
+- Quan sát: Kết quả gợi ý tổng hợp trả về cả phần tiếp theo của Star Wars lẫn The Matrix
+  (*Star Wars VI*, *The Force Awakens*, *Matrix Reloaded*...).
+- Thuyết minh: "Hệ thống trích xuất các vector đặc trưng ẩn từ tầng Gold trên HDFS của toàn bộ các phim
+  trong Watchlist, tổng hợp thành một Pseudo-User Vector đại diện cho gu người dùng ảo và gợi ý
+  chính xác mà không cần tài khoản lịch sử."
+
+BƯỚC 6: DEMO LUỒNG STREAMING KAFKA THỜI GIAN THỰC
+- Chuyển sang Tab "📡 Streaming & Kafka Logs".
+- Quan sát: Các sự kiện `rate`, `add_to_watchlist` vừa thao tác hiển thị đầy đủ thời gian thực,
+  trạng thái Kafka Connected: True.
+- Bấm nút "Bắn 1 Event Test Vào Kafka" để minh họa sự kiện ngẫu nhiên sinh ra tức thì.
+
+BƯỚC 7: KẾT THÚC VÀ TẮT HỆ THỐNG
+- Chạy file `STOP_SYSTEM.bat` để dừng an toàn mọi dịch vụ.
+================================================================================
+HOÀN TẤT HƯỚNG DẪN 6 - HỆ THỐNG ĐÃ HOÀN THIỆN ĐẦY ĐỦ 100% CÁC TIÊU CHÍ ĐỒ ÁN!
+================================================================================

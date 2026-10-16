@@ -1,0 +1,119 @@
+TỔNG QUAN 3 MÀN HÌNH CẦN CHUẨN BỊ TRƯỚC KHI BẮT ĐẦU:
+Màn hình 1 (Terminal WSL): Dùng để gõ lệnh kiểm tra hạ tầng HDFS và theo dõi Kafka Consumer.
+Màn hình 2 (Trình duyệt Web quản trị Big Data):
+Tab 1: WebHDFS NameNode — http://localhost:9870
+Tab 2: Apache Airflow — http://localhost:8080 (Tài khoản: admin / Mật khẩu: rQkxSVcQXRPZq7sZ)
+Màn hình 3 (Trình duyệt Web Serving):
+Tab 3: Web Recommender — http://localhost:8000
+BƯỚC 0: KHỞI ĐỘNG CỤM PHÂN TÁN (1-CLICK)
+Thao tác: Ra màn hình Desktop, nhấp đúp vào START_BIGDATA_SYSTEM.lnk (hoặc chạy 
+START_SYSTEM.bat
+).
+Quan sát: Cửa sổ dòng lệnh tự động bật 4 dịch vụ: Hadoop NameNode, DataNode 1, DataNode 2, Kafka KRaft và Web Server.
+Bật thêm Airflow (nếu cần demo phần điều phối): Mở 1 terminal WSL gõ:
+bash
+
+
+python3 -m airflow standalone
+🎙️ Lời dẫn: "Em xin phép khởi động toàn bộ hệ sinh thái Big Data gồm cụm HDFS 2 DataNodes, Kafka KRaft broker và Web Server thông qua kịch bản tự động hóa 1-click."
+BƯỚC 1: DEMO HẠ TẦNG PHÂN TÁN HDFS & TẦNG BRONZE (RAW DATA)
+Mục đích: Chứng minh hệ thống có tính chất lưu trữ phân tán và nạp dữ liệu thô chuẩn kiến trúc Lakehouse.
+
+Trên Trình duyệt WebHDFS (http://localhost:9870):
+
+Tại trang chủ Overview: Chỉ vào dòng Live Nodes = 2.
+🎙️ Lời dẫn: "Đầu tiên ở tầng hạ tầng, hệ thống đã triển khai cụm Hadoop HDFS phân tán với 2 DataNodes hoạt động độc lập (cổng dữ liệu 9866 và 9886). Dữ liệu được cấu hình hệ số nhân bản Replication Factor = 2, nghĩa là mọi block dữ liệu đều được phân tán cân bằng sang cả 2 DataNode vật lý để đảm bảo khả năng chịu lỗi (Fault Tolerance)."
+Duyệt tầng Bronze trên giao diện WebHDFS:
+
+Vào menu Utilities -> Browse the file system, gõ đường dẫn: /lakehouse/bronze/movielens/.
+Chỉ cho giảng viên thấy các tệp thô: ratings.csv (646.8 MB - 25 triệu dòng), movies.csv, movies_metadata.csv, links.csv.
+Gõ lệnh CLI trên Terminal WSL (để tăng tính thuyết phục):
+
+bash
+
+
+hdfs dfsadmin -report
+hdfs dfs -ls -h /lakehouse/bronze/movielens/
+BƯỚC 2: DEMO TẦNG SILVER (PYSPARK BATCH ETL & SNAPPY PARQUET)
+Mục đích: Chứng minh kỹ năng xử lý dữ liệu lớn (ETL), nén dữ liệu và truy vấn Spark SQL.
+
+Kiểm tra kết quả nén dữ liệu Parquet trên HDFS:
+
+Trên WebHDFS (hoặc Terminal), mở đường dẫn: /lakehouse/silver/ratings/ và /lakehouse/silver/movies/.
+Gõ lệnh kiểm tra dung lượng:
+bash
+
+
+hdfs dfs -du -h /lakehouse/silver/
+🎙️ Lời dẫn: "Ở tầng Silver, quy trình PySpark Batch trong clean_data.py đã làm sạch, chuẩn hóa kiểu dữ liệu cho 25 triệu dòng đánh giá và 62.423 bộ phim. Điểm đặc biệt về mặt kỹ thuật Big Data là chúng em đã chuyển đổi định dạng từ CSV thô sang dạng cột Snappy Parquet, giúp dung lượng tệp ratings giảm từ 646.8 MB xuống chỉ còn 195.4 MB (tiết kiệm 69.8% dung lượng lưu trữ), đồng thời tối ưu hóa chi phí đọc I/O chỉ quét các cột cần thiết."
+Chạy thử truy vấn Spark SQL phân tích trên tầng Silver:
+
+Trong terminal WSL, chạy script truy vấn:
+bash
+
+
+python3 /home/dell/query_movies.py
+🎙️ Lời dẫn: "Chương trình query_movies.py sử dụng Spark SQL truy vấn trực tiếp trên bảng movies_silver dạng cột Parquet, lọc Top 5 tác phẩm kinh điển có điểm TMDb 
+≥
+8.0
+≥8.0 và kinh phí 
+>
+10
+>10 triệu USD chỉ trong vài giây mà không cần tốn chi phí Shuffle JOIN lại các bảng thô ở tầng Bronze."
+BƯỚC 3: DEMO TẦNG GOLD (HỌC MÁY PHÂN TÁN ALS & MA TRẬN NHÂN TỬ ẨN)
+Mục đích: Chứng minh việc huấn luyện mô hình Machine Learning trên Spark MLlib và trích xuất tri thức vào Lakehouse.
+
+Kiểm tra tệp Gold trên HDFS:
+Mở đường dẫn: /lakehouse/gold/ trên WebHDFS.
+Thấy 2 thư mục:
+/lakehouse/gold/movie_recommendations/: Kết quả gợi ý Top 5 cho các user mẫu.
+/lakehouse/gold/movie_factors/: Chứa các tệp Parquet lưu 19.550 vector đặc trưng tiềm ẩn (rank = 10) của các bộ phim.
+🎙️ Lời dẫn: "Tại tầng Gold, thuật toán Matrix Factorization ALS của thư viện Spark MLlib được huấn luyện trên ma trận User-Item thưa thớt. Thay vì chỉ sinh danh sách Top-5 cố định cho người dùng cũ, mô hình đã trích xuất ma trận nhân tử ẩn movie_factors gồm 19.550 vector đặc trưng 10 chiều ghi xuống HDFS tầng Gold. Ma trận này chính là tri thức cốt lõi để tầng Serving sau đó có thể tính toán gợi ý tức thời (On-the-fly) cho bất kỳ người dùng mới nào."
+BƯỚC 4: DEMO LUỒNG STREAMING THỜI GIAN THỰC VỚI APACHE KAFKA
+Mục đích: Thể hiện luồng thu nhận sự kiện thời gian thực (Real-time Ingestion) kết nối giữa Web và Kafka Broker cổng 9092.
+
+Mở Terminal lắng nghe trực tiếp Kafka Console Consumer:
+
+Trong terminal WSL, chạy lệnh:
+bash
+
+
+/home/dell/kafka_2.12-3.6.2/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic movie_logs
+(Cửa sổ này sẽ đứng chờ sẵn sự kiện từ Web).
+
+Thao tác trên Web Serving (http://localhost:8000):
+
+Đặt cửa sổ trình duyệt Web nằm cạnh cửa sổ Terminal Kafka.
+Trên Web, gõ tìm phim Toy Story (1995) -> Nhấp chấm 5★ (hoặc bấm nút ❤️ Yêu thích).
+👉 Quan sát tức thì: Ngay lập tức trên cửa sổ Terminal Kafka Consumer, một bản tin JSON streaming nhảy ra:
+json
+
+
+{"timestamp": "2026-10-15 ...", "user_id": 99999, "movie_id": 1, "action": "rate", "rating": 5.0}
+Chuyển sang tab 📡 Streaming & Kafka Logs trên Web: Thấy bảng thống kê cập nhật trực tiếp sự kiện vừa phát sinh.
+🎙️ Lời dẫn: "Hệ thống sử dụng Apache Kafka chế độ KRaft vận hành tại cổng 9092. Mọi hành vi của người dùng trên Web như đánh giá sao, thêm/bớt phim yêu thích đều được đóng gói thành sự kiện JSON và phát tán tức thời vào topic movie_logs với độ trễ dưới 50ms. Đồng thời, module spark_streaming.py sẽ hứng các micro-batch này và lưu vết kiểm toán xuống HDFS /lakehouse/silver/streaming_logs/."
+
+BƯỚC 5: DEMO TỰ ĐỘNG HÓA PIPELINE BẰNG APACHE AIRFLOW
+Mục đích: Chứng minh năng lực điều phối luồng dữ liệu tự động của kỹ sư Data Engineer.
+
+Trên Trình duyệt Airflow (http://localhost:8080):
+Đăng nhập: admin / rQkxSVcQXRPZq7sZ.
+Tìm DAG: lakehouse_pipeline (hoặc movie_data_pipeline).
+Mở mục Graph View: Chỉ cho giảng viên thấy biểu đồ các Task phụ thuộc theo thứ tự.
+Bấm nút Trigger DAG (Play): Quan sát các Task đổi màu sang xanh lá cây (Success) sau khi hoàn tất.
+🎙️ Lời dẫn: "Để quy trình không phải chạy thủ công, Apache Airflow đóng vai trò điều phối viên (Orchestrator). DAG được lên lịch định kỳ hàng ngày, đảm bảo tính phụ thuộc nghiêm ngặt: Tác vụ làm sạch tầng Silver phải hoàn tất thành công thì mới kích hoạt tác vụ huấn luyện lại ALS ở tầng Gold."
+BƯỚC 6: DEMO TẦNG PHỤC VỤ (SERVING LAYER & HYBRID RECOMMENDER)
+Mục đích: Cho thấy sản phẩm đầu cuối khai thác dữ liệu từ tầng Gold của Lakehouse để phục vụ người dùng thông minh.
+
+Trên Web Serving (http://localhost:8000):
+Thao tác 1 (Similar Mode - 5★): Chọn phim Star Wars: Episode IV -> Đánh giá 5★ -> Hệ thống đọc vector ẩn ALS từ Gold và bóc tách Franchise Root để gợi ý các phần tiếp theo (Star Wars V, VI, Rogue One) với nhãn 🔥 99% Hợp.
+Thao tác 2 (Contrast Mode - 1★): Giữ nguyên phim đó, chuyển sang 1★ -> Hệ thống kích hoạt chiến lược đổi khẩu vị, loại bỏ phim viễn tưởng, đổi sang kiệt tác đối lập (The Shawshank Redemption, The Godfather...).
+Thao tác 3 (Watchlist & Pseudo-User Vector): Chọn thêm The Matrix vào mục Yêu thích -> Vào tab ❤️ Phim Yêu Thích -> Bấm 🔮 GỢI Ý TỪ TOÀN BỘ PHIM YÊU THÍCH -> Hệ thống gom các vector ẩn từ tầng Gold của các phim trong danh sách để tạo ra một vector người dùng ảo, giải quyết trọn vẹn bài toán New-User Cold-Start.
+🎙️ Lời dẫn: "Toàn bộ kết quả hiển thị trên Web không phải là dữ liệu giả lập, mà được tính toán on-the-fly dựa trên ma trận vector đặc trưng ẩn nạp trực tiếp từ tầng Gold của HDFS thông qua WebHDFS REST API kết hợp với bộ lọc tri thức thể loại."
+BƯỚC 7: KẾT THÚC VÀ DỪNG CỤM HỆ THỐNG
+Nhấp đúp vào 
+STOP_SYSTEM.bat
+ để dọn dẹp và dừng an toàn mọi tiến trình phân tán.
+🎙️ Lời kết: "Bài báo cáo của nhóm đã chứng minh trọn vẹn vòng đời dữ liệu lớn: từ lưu trữ phân tán chịu lỗi trên HDFS 2 DataNodes, tiền xử lý và nén Parquet bằng PySpark, huấn luyện mô hình học máy ALS, thu nhận luồng thời gian thực Kafka, điều phối tự động Airflow đến ứng dụng phục vụ người dùng cuối. Em xin chân thành cảm ơn Thầy/Cô!"

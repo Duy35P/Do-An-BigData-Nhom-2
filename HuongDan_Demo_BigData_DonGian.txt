@@ -1,0 +1,90 @@
+================================================================================
+HƯỚNG DẪN DEMO ĐỒ ÁN BIG DATA (BẢN ĐƠN GIẢN - TRỌNG TÂM KIẾN TRÚC)
+ĐỀ TÀI: HỆ THỐNG GỢI Ý PHIM DỰA TRÊN LAKEHOUSE VÀ ĐIỆN TOÁN PHÂN TÁN
+================================================================================
+
+A. CÁC ĐỊA CHỈ TRUY CẬP TRÊN TRÌNH DUYỆT (MỞ SẴN 3 TAB)
+--------------------------------------------------------------------------------
+1. HADOOP HDFS (LƯU TRỮ PHÂN TÁN):
+   - Đường dẫn: http://localhost:9870
+   - Mục đích: Chứng minh cụm có 2 DataNodes và xem 3 tầng Bronze - Silver - Gold.
+
+2. APACHE AIRFLOW (ĐIỀU PHỐI TỰ ĐỘNG):
+   - Đường dẫn: http://localhost:8080
+   - Tài khoản đăng nhập:
+     + Username: admin
+     + Password: rQkxSVcQXRPZq7sZ
+   - Mục đích: Chứng minh quy trình chạy tự động (DAG Pipeline).
+
+3. WEB APP GỢI Ý PHIM (SERVING LAYER):
+   - Đường dẫn: http://localhost:8000
+   - Mục đích: Thao tác chọn phim để kích hoạt gợi ý từ Gold và bắn log vào Kafka.
+
+================================================================================
+B. BƯỚC 1: KHỞI ĐỘNG HỆ THỐNG
+================================================================================
+1. Ra màn hình Desktop, nhấp đúp vào:
+   -> START_BIGDATA_SYSTEM.lnk (hoặc file START_SYSTEM.bat trong thư mục dự án).
+2. Đợi 10 - 15 giây cho toàn bộ NameNode, 2 DataNodes, Kafka và Web bật lên.
+3. (Tùy chọn) Để bật thêm giao diện Airflow:
+   - Mở 1 cửa sổ WSL (gõ wsl trên PowerShell) và chạy lệnh:
+     python3 -m airflow standalone
+
+================================================================================
+C. 4 BƯỚC DEMO TRỌNG TÂM BIG DATA TRƯỚC GIẢNG VIÊN
+================================================================================
+
+--------------------------------------------------------------------------------
+BƯỚC 1: CHỨNG MINH HẠ TẦNG HDFS & KIẾN TRÚC MEDALLION (TẠI TAB http://localhost:9870)
+--------------------------------------------------------------------------------
+1. Tại trang chủ WebHDFS:
+   - Chỉ vào dòng "Live Nodes": Có số 2 (chứng minh cụm HDFS có 2 DataNode hoạt động).
+2. Vào mục "Utilities" -> "Browse the file system", gõ đường dẫn: /lakehouse
+   - Cho thầy/cô thấy 3 tầng dữ liệu Medallion:
+     * /lakehouse/bronze/movielens/: Dữ liệu thô CSV ban đầu (25 triệu rating).
+     * /lakehouse/silver/: Dữ liệu đã làm sạch, nén Snappy Parquet dạng cột.
+     * /lakehouse/gold/movie_factors/: Chứa 19.550 vector đặc trưng ẩn do ALS học được.
+=> Thuyết minh: "Dữ liệu được tổ chức theo chuẩn kiến trúc Medallion Lakehouse, lưu trữ phân tán trên 2 DataNode với định dạng cột Parquet để tối ưu hóa truy vấn Spark."
+
+--------------------------------------------------------------------------------
+BƯỚC 2: CHỨNG MINH LUỒNG STREAMING THỜI GIAN THỰC KAFKA (PORT 9092)
+--------------------------------------------------------------------------------
+1. Mở một cửa sổ Terminal WSL, gõ lệnh lắng nghe trực tiếp kênh Kafka:
+   /home/dell/kafka_2.12-3.6.2/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic movie_logs
+
+2. Quay sang Web (http://localhost:8000):
+   - Bấm đánh giá sao (1★ hoặc 5★) cho một phim bất kỳ, hoặc bấm nút "❤️ Yêu thích".
+3. Nhìn sang Terminal:
+   - Lập tức thấy bản tin JSON nhảy ra thời gian thực:
+     {"timestamp": "...", "user_id": 99999, "movie_id": ..., "action": "rate", ...}
+=> Thuyết minh: "Mọi tương tác của người dùng trên Web đều được phát tán thời gian thực vào Apache Kafka Broker topic movie_logs với độ trễ tính bằng mili-giây."
+
+--------------------------------------------------------------------------------
+BƯỚC 3: CHỨNG MINH ĐIỀU PHỐI TỰ ĐỘNG BẰNG AIRFLOW (TẠI TAB http://localhost:8080)
+--------------------------------------------------------------------------------
+1. Đăng nhập vào Airflow (admin / rQkxSVcQXRPZq7sZ).
+2. Tìm DAG: lakehouse_pipeline (hoặc movie_data_pipeline).
+3. Nhấp vào DAG và mở xem mục "Graph View":
+   - Thể hiện các bước phụ thuộc: Làm sạch dữ liệu Silver -> Huấn luyện mô hình ALS Gold -> Kiểm tra.
+4. Bấm nút Play (Trigger DAG) để kích hoạt chạy thử chu trình tự động.
+=> Thuyết minh: "Toàn bộ luồng ETL và huấn luyện lại mô hình học máy được tự động hóa bằng Apache Airflow DAG theo lịch định kỳ mỗi ngày."
+
+--------------------------------------------------------------------------------
+BƯỚC 4: CHỨNG MINH MÔ HÌNH HỌC MÁY GỢI Ý ALS TỪ TẦNG GOLD (TẠI TAB http://localhost:8000)
+--------------------------------------------------------------------------------
+1. Demo Gợi ý cùng bộ (Franchise-Aware):
+   - Chọn phim "Star Wars: Episode IV" -> Đánh giá 5★.
+   - Kết quả trả về các phần tiếp theo (Star Wars VI, V, Rogue One...) độ hợp 99%.
+2. Demo Đổi khẩu vị (Contrast Mode):
+   - Chuyển sang 1★ -> Danh sách lập tức đổi 100% sang các kiệt tác khác (The Godfather, Shawshank...).
+3. Demo Mục Phim Yêu Thích (Watchlist):
+   - Lưu 2 phim Star Wars và The Matrix vào Yêu thích -> Chuyển sang Tab "❤️ Phim Yêu Thích".
+   - Bấm nút "🔮 GỢI Ý TỪ TOÀN BỘ PHIM YÊU THÍCH": Hệ thống lấy các vector ẩn từ HDFS Gold tổng hợp thành 1 vector người dùng ảo để gợi ý kết hợp cả 2 phim mà không bị lỗi Cold-Start.
+=> Thuyết minh: "Mô hình ALS trên Spark MLlib phân rã ma trận thành các nhân tử ẩn lưu tại tầng Gold, kết hợp với Content Similarity để phục vụ gợi ý tức thì."
+
+================================================================================
+D. KẾT THÚC VÀ TẮT HỆ THỐNG
+================================================================================
+- Khi demo xong, nhấp đúp vào file STOP_SYSTEM.bat (hoặc STOP_SYSTEM.ps1) trong thư mục dự án.
+- Tất cả tiến trình sẽ được tắt an toàn, giải phóng hoàn toàn RAM cho máy tính.
+================================================================================

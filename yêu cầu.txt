@@ -1,0 +1,23 @@
+A.3. Môi trường kỹ thuật bắt buộc
+Thành phần Phiên bản tối thiểu Ghi chú
+Apache Hadoop (HDFS
++ YARN)
+
+3.3.x Chạy pseudo-distributed hoặc cụm 3
+
+node
+
+Apache Spark 3.5.x PySpark; submit lên YARN hoặc Spark
+
+Standalone
+
+Delta Lake 3.1.x (delta-spark) Tương thích Spark 3.5
+Apache Airflow 2.9.x SparkSubmitOperator hoặc BashOperator
+Apache Kafka 3.6.x Chỉ bắt buộc với đề tài có streaming
+Web backend FastAPI hoặc Flask Streamlit 
+
+
+Web frontend React/Vue hoặc Jinja2 +
+
+Chart.js (cái gì cũng được)
+

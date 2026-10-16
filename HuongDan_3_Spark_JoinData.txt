@@ -1,0 +1,92 @@
+====================================================================
+HƯỚNG DẪN 3: BỔ SUNG DỮ LIỆU METADATA VÀ XỬ LÝ BẰNG PYSPARK
+====================================================================
+
+PHẦN 1: TẢI VÀ ĐƯA DỮ LIỆU MỚI LÊN HDFS (DATANODE)
+--------------------------------------------------------------------
+Bước 1: Tải bộ "The Movies Dataset" (của Rounak Banik) trên Kaggle về máy Windows (ổ E hoặc tùy ổ, nhớ đổi đường dẫn khi gõ lệnh giải nén). 
+https://www.kaggle.com/datasets/rounakbanik/the-movies-dataset?resource=download
+Bước 2: Mở terminal Ubuntu (WSL) và giải nén trực tiếp từ ổ E của Windows vào Ubuntu:
+    unzip /mnt/e/archive.zip -d extra_movie_data
+
+Bước 3: Đẩy 2 file quan trọng nhất lên Tầng Bronze của HDFS:
+    hdfs dfs -put extra_movie_data/movies_metadata.csv /lakehouse/bronze/movielens/
+    hdfs dfs -put extra_movie_data/credits.csv /lakehouse/bronze/movielens/
+
+Bước 4: Cấu hình nhân bản dữ liệu (Replication = 2) để dữ liệu được chia đều qua các DataNode:
+    hdfs dfs -setrep -R 2 /lakehouse/bronze/movielens/
+
+Bước 5: Kiểm tra lại xem file đã có trên HDFS chưa:
+    hdfs dfs -ls -h /lakehouse/bronze/movielens/
+
+
+PHẦN 2: CÀI ĐẶT MÔI TRƯỜNG PYSPARK
+--------------------------------------------------------------------
+Bước 1: Cài đặt công cụ quản lý gói pip3 (Nếu máy chưa có):
+    sudo apt update
+    sudo apt install -y python3-pip
+
+Bước 2: Cài đặt PySpark (Bản 3.5.1 để tương thích Java 8 của Hadoop). 
+*Lưu ý: Dùng cờ --break-system-packages để ép cài đặt trên Ubuntu mới, và dùng máy chủ châu Á (Tsinghua) để tải siêu tốc:*
+    pip3 install pyspark==3.5.1 --break-system-packages -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+
+PHẦN 3: VIẾT CODE SPARK ĐỂ GHÉP (JOIN) DỮ LIỆU
+--------------------------------------------------------------------
+Bước 1: Dùng lệnh cat để tự động tạo và ghi file code `process_movies.py`:
+Copy và dán toàn bộ đoạn sau vào terminal rồi Enter:
+
+cat << 'EOF' > process_movies.py
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+import time
+
+spark = SparkSession.builder \
+    .appName("MovieData_Join") \
+    .master("local[*]") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+print("Đang đọc và xử lý dữ liệu từ HDFS, vui lòng đợi...")
+
+# Đọc file với đường dẫn đầy đủ
+df_movies = spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/movies.csv", header=True, inferSchema=True)
+df_links  = spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/links.csv", header=True, inferSchema=True)
+df_meta   = spark.read.csv("hdfs://localhost:9000/lakehouse/bronze/movielens/movies_metadata.csv", 
+                           header=True, inferSchema=True, quote='"', escape='"', multiLine=True)
+
+# Join dữ liệu
+df_step1 = df_movies.join(df_links, on="movieId", how="inner")
+df_meta = df_meta.withColumn("id", F.col("id").cast("integer"))
+df_joined = df_step1.join(df_meta, df_step1["tmdbId"] == df_meta["id"], how="inner")
+
+# Chọn lọc các cột
+df_final = df_joined.select(
+    df_movies["movieId"],
+    df_movies["title"].alias("TenPhim"),
+    df_movies["genres"].alias("TheLoai"),
+    df_meta["overview"].alias("TomTatNoiDung"),
+    df_meta["vote_average"].alias("DiemTMDB"),
+    df_meta["budget"].alias("KinhPhi")
+)
+
+print("\n--- KẾT QUẢ SAU KHI XỬ LÝ (5 BỘ PHIM ĐẦU TIÊN) ---")
+df_final.show(5, truncate=60)
+
+print("\nTruy cập http://localhost:4040 trên trình duyệt để xem giao diện Spark UI...")
+time.sleep(600) # Dừng 10 phút để kịp xem giao diện
+spark.stop()
+EOF
+
+
+PHẦN 4: CHẠY CODE VÀ XEM GIAO DIỆN SPARK UI
+--------------------------------------------------------------------
+Bước 1: Chạy file vừa tạo:
+    python3 process_movies.py
+
+Bước 2: Khi màn hình hiện kết quả và đang chờ 10 phút, mở trình duyệt web trên máy tính vào link:
+    http://localhost:4040
+    (Vào tab SQL / DataFrame -> Bấm vào link showString để xem sơ đồ DAG).
+
+Bước 3: Sau khi xem xong, quay lại terminal bấm `Ctrl + C` để tắt ngang Spark.
+====================================================================
